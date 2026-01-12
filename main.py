@@ -301,8 +301,7 @@ def format_transaction(tx: Dict) -> str:
 
 
 async def main_screen_text_owner(user_id: int) -> str:
-    s = await gas_request({"cmd": "summary_month"}, user_id)
-    txs = await gas_request({"cmd": "get_last_transactions", "limit": 5}, user_id)
+    s = await gas_request({"cmd": "get_main_screen", "limit": 5}, user_id)
     
     month = s.get("month_label", "Текущий месяц")
     exp = s.get("expenses", 0)
@@ -329,7 +328,7 @@ async def main_screen_text_owner(user_id: int) -> str:
         f"💰 Долги передо мной: <b>{debts_owe_me:,.2f}</b> ₽\n"
     ).replace(",", " ")
     
-    transactions = txs.get("transactions", [])
+    transactions = s.get("transactions", [])
     if transactions:
         text += "\n<b>📋 Последние 5 операций:</b>\n\n"
         for tx in transactions[:5]:
@@ -341,7 +340,7 @@ async def main_screen_text_owner(user_id: int) -> str:
 async def main_screen_text_employee(user_id: int) -> str:
     from datetime import datetime
     
-    txs = await gas_request({"cmd": "get_last_transactions", "limit": 10}, user_id)
+    s = await gas_request({"cmd": "get_main_screen", "limit": 10}, user_id)
     
     now = datetime.now()
     date_str = now.strftime("%d %B %Y").replace(
@@ -360,7 +359,7 @@ async def main_screen_text_employee(user_id: int) -> str:
         f"<b>📋 Последние 10 операций:</b>\n\n"
     )
     
-    transactions = txs.get("transactions", [])
+    transactions = s.get("transactions", [])
     if transactions:
         for tx in transactions[:10]:
             text += format_transaction(tx) + "\n"
@@ -368,8 +367,6 @@ async def main_screen_text_employee(user_id: int) -> str:
         text += "Пока нет операций"
     
     return text
-
-
 async def get_categories(user_id: int) -> Dict[str, Any]:
     return await gas_request({"cmd": "get_categories"}, user_id)
 
