@@ -29,28 +29,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("detailing-finance-bot")
 
-
-# =========================
-# CONFIG from ENV
-# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SCRIPT_URL = os.getenv("SCRIPT_URL", "").strip()
 
-# Список разрешенных user_id через запятую
 USER_TG_IDS_STR = os.getenv("USER_TG_IDS", "").strip()
 if USER_TG_IDS_STR:
     USER_TG_IDS = [int(x.strip()) for x in USER_TG_IDS_STR.split(",") if x.strip()]
 else:
     USER_TG_IDS = []
 
-# ID владельцев (полный доступ)
 OWNER_IDS_STR = os.getenv("OWNER_IDS", "").strip()
 if OWNER_IDS_STR:
     OWNER_IDS = [int(x.strip()) for x in OWNER_IDS_STR.split(",") if x.strip()]
 else:
     OWNER_IDS = []
 
-# Для webhook (Railway)
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "").strip()
@@ -68,9 +61,6 @@ def _default_webhook_path() -> str:
     return f"tg/{h[:24]}"
 
 
-# =========================
-# Phrases
-# =========================
 PH_SAVED_INCOME = [
     "Отлично! ✅ Записал поступление.",
     "Есть! ✅ Зафиксировал.",
@@ -88,10 +78,6 @@ PH_SAVED_EXPENSE = [
 
 DENY_TEXT = "Извини, доступ закрыт 🙂"
 
-
-# =========================
-# Conversation states
-# =========================
 (
     ST_MENU,
     ST_ADD_CHOOSE_TYPE,
@@ -110,11 +96,7 @@ DENY_TEXT = "Извини, доступ закрыт 🙂"
 ) = range(14)
 
 
-# =========================
-# Helpers: temp messages
-# =========================
 async def delete_working_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Удалить текущее рабочее сообщение"""
     msg_id = context.user_data.get("working_message_id")
     if msg_id:
         try:
@@ -124,11 +106,7 @@ async def delete_working_message(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     context.user_data["working_message_id"] = None
 
 
-# =========================
-# Helpers: keyboards
-# =========================
 def is_allowed(update: Update) -> bool:
-    """Проверка доступа - разрешен ли пользователь"""
     user = update.effective_user
     if not user:
         return False
@@ -136,12 +114,10 @@ def is_allowed(update: Update) -> bool:
 
 
 def is_owner(user_id: int) -> bool:
-    """Проверка - является ли пользователь владельцем"""
     return user_id in OWNER_IDS
 
 
 def kb_main_owner() -> InlineKeyboardMarkup:
-    """Главное меню для владельцев"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Внести транзакцию", callback_data="menu:add")],
         [InlineKeyboardButton("📊 Анализ", callback_data="menu:analysis")],
@@ -151,7 +127,6 @@ def kb_main_owner() -> InlineKeyboardMarkup:
 
 
 def kb_main_employee() -> InlineKeyboardMarkup:
-    """Главное меню для сотрудников"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Внести транзакцию", callback_data="menu:add")],
     ])
@@ -166,7 +141,6 @@ def kb_choose_type() -> InlineKeyboardMarkup:
 
 
 def kb_expense_categories(categories: List[str]) -> InlineKeyboardMarkup:
-    """Динамическая клавиатура категорий расходов"""
     rows = []
     row = []
     for i, c in enumerate(categories):
@@ -181,7 +155,6 @@ def kb_expense_categories(categories: List[str]) -> InlineKeyboardMarkup:
 
 
 def kb_income_categories(categories: List[str]) -> InlineKeyboardMarkup:
-    """Динамическая клавиатура категорий доходов"""
     rows = []
     for i, c in enumerate(categories):
         rows.append([InlineKeyboardButton(c, callback_data=f"inccat:{i}")])
@@ -190,7 +163,6 @@ def kb_income_categories(categories: List[str]) -> InlineKeyboardMarkup:
 
 
 def kb_payment_types(payment_types: List[str]) -> InlineKeyboardMarkup:
-    """Динамическая клавиатура форм оплаты"""
     rows = []
     for i, p in enumerate(payment_types):
         emoji = "💵" if p == "Наличные" else ("📱" if p == "QR код" else "🏢")
@@ -256,9 +228,6 @@ def kb_debts_actions() -> InlineKeyboardMarkup:
     ])
 
 
-# =========================
-# Amount parsing
-# =========================
 def parse_amount(text: str) -> Optional[float]:
     if not text:
         return None
@@ -295,11 +264,7 @@ def parse_amount(text: str) -> Optional[float]:
         return None
 
 
-# =========================
-# GAS API
-# =========================
 async def gas_request(payload: Dict[str, Any], user_id: int) -> Dict[str, Any]:
-    """Отправить запрос в GAS с указанным user_id"""
     payload = dict(payload)
     payload["user_id"] = user_id
 
@@ -318,17 +283,14 @@ async def gas_request(payload: Dict[str, Any], user_id: int) -> Dict[str, Any]:
 
 
 def format_transaction(tx: Dict) -> str:
-    """Форматировать транзакцию для отображения"""
     type_emoji = "➕" if tx["type"] == "доход" else "➖"
     amount_str = f"{tx['amount']:,.0f} ₽".replace(",", " ")
     
     if tx["type"] == "доход":
-        # Доход: ➕ 25 000 ₽ — BMW X5 — QR код
         comment = tx.get("comment", "")
         category = tx.get("category", "")
         return f"{type_emoji} {amount_str} — {comment} — {category}"
     else:
-        # Расход: ➖ 5 000 ₽ — Инструменты — Наличные
         category = tx.get("category", "")
         payment_type = tx.get("payment_type", "")
         comment = tx.get("comment", "")
@@ -339,7 +301,6 @@ def format_transaction(tx: Dict) -> str:
 
 
 async def main_screen_text_owner(user_id: int) -> str:
-    """Получить текст главного экрана для владельца"""
     s = await gas_request({"cmd": "summary_month"}, user_id)
     txs = await gas_request({"cmd": "get_last_transactions", "limit": 5}, user_id)
     
@@ -368,7 +329,6 @@ async def main_screen_text_owner(user_id: int) -> str:
         f"💰 Долги передо мной: <b>{debts_owe_me:,.2f}</b> ₽\n"
     ).replace(",", " ")
     
-    # Добавляем последние 5 транзакций
     transactions = txs.get("transactions", [])
     if transactions:
         text += "\n<b>📋 Последние 5 операций:</b>\n\n"
@@ -379,7 +339,6 @@ async def main_screen_text_owner(user_id: int) -> str:
 
 
 async def main_screen_text_employee(user_id: int) -> str:
-    """Получить текст главного экрана для сотрудника"""
     from datetime import datetime
     
     txs = await gas_request({"cmd": "get_last_transactions", "limit": 10}, user_id)
@@ -412,13 +371,9 @@ async def main_screen_text_employee(user_id: int) -> str:
 
 
 async def get_categories(user_id: int) -> Dict[str, Any]:
-    """Получить категории"""
     return await gas_request({"cmd": "get_categories"}, user_id)
 
 
-# =========================
-# Handlers
-# =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
@@ -546,8 +501,6 @@ async def back_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ST_MENU
 
 
-# ========== ВНЕСЕНИЕ ТРАНЗАКЦИИ ==========
-
 async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -600,7 +553,7 @@ async def income_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tx = context.user_data.get("tx", {})
     tx["type"] = "доход"
     tx["category"] = cat
-    tx["payment_type"] = cat  # Для доходов категория = форма оплаты
+    tx["payment_type"] = cat
     context.user_data["tx"] = tx
 
     prompt = "Сколько?\n\nПримеры: <code>2500</code>, <code>2 500</code>, <code>2.500</code>, <code>2500,50</code>, <code>2к</code>"
@@ -634,7 +587,6 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     work_msg_id = context.user_data.get("working_message_id")
     
-    # Для расходов спрашиваем форму оплаты
     if tx.get("type") == "расход":
         categories = context.user_data.get("categories", {})
         payment_types = categories.get("payment_types", [])
@@ -650,9 +602,8 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         
-        return ST_PAYMENT_TYPE
+        return ST_EXP_PAYMENT_TYPE
     else:
-        # Для доходов сразу спрашиваем комментарий
         if work_msg_id:
             try:
                 category = tx.get("category", "")
@@ -685,7 +636,6 @@ async def payment_type_selected(update: Update, context: ContextTypes.DEFAULT_TY
     tx["payment_type"] = payment_type
     context.user_data["tx"] = tx
 
-    # Спрашиваем комментарий
     await q.edit_message_text("Добавишь коммент?", reply_markup=kb_skip_comment())
     return ST_COMMENT
 
@@ -715,7 +665,6 @@ async def comment_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tx = context.user_data.get("tx", {})
     comment_text = (update.message.text or "").strip()
     
-    # Проверка для доходов - комментарий обязателен
     if tx.get("type") == "доход" and not comment_text:
         await delete_working_message(context, update.effective_chat.id)
         
@@ -737,8 +686,6 @@ async def comment_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def save_and_finish_(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохранить транзакцию и показать финальное подтверждение + главный экран"""
-    
     await delete_working_message(context, update.effective_chat.id)
     
     user_id = update.effective_user.id
@@ -789,8 +736,6 @@ async def save_and_finish_(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.effective_chat.send_message(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
 
-
-# ========== АНАЛИЗ ==========
 
 async def analysis_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -852,7 +797,7 @@ async def analysis_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         text = text.replace(",", " ")
         
-    else:  # expense
+    else:
         res = await gas_request({"cmd": "analysis_expense", "period": period}, user_id)
         
         total = res.get("total", 0)
@@ -977,8 +922,6 @@ async def special_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ST_MENU
 
 
-# ========== БАЛАНС ==========
-
 async def balance_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1044,8 +987,6 @@ async def balance_edit_received(update: Update, context: ContextTypes.DEFAULT_TY
     
     return ST_MENU
 
-
-# ========== ДОЛГИ ==========
 
 async def debts_choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1121,8 +1062,6 @@ async def debts_edit_received(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ST_MENU
 
 
-# ========== HELP & ERROR ==========
-
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
@@ -1170,7 +1109,7 @@ def build_app() -> Application:
             ST_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, amount_received),
             ],
-            ST_PAYMENT_TYPE: [
+            ST_EXP_PAYMENT_TYPE: [
                 CallbackQueryHandler(payment_type_selected, pattern=r"^payment:\d+$"),
             ],
             ST_COMMENT: [
@@ -1234,12 +1173,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-```
-
----
-
-## requirements.txt (тот же):
-```
-python-telegram-bot[webhooks]==21.6
-aiohttp==3.10.10
-```
