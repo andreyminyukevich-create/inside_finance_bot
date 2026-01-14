@@ -93,11 +93,15 @@ DENY_TEXT = "Извини, доступ закрыт 🙂"
     ST_BALANCE_EDIT,
     ST_DEBTS_SELECT,
     ST_DEBTS_AMOUNT,
+    ST_DEBTS_ADD_NAME,
+    ST_DEBTS_ADD_AMOUNT,
+    ST_DEBTS_ADD_PAYMENT,
+    ST_DEBTS_ADD_COMMENT,
     ST_FILM_CLIENT,
     ST_FILM_METERS,
     ST_FILM_AMOUNT,
     ST_FILM_PAYMENT,
-) = range(18)
+) = range(22)
 
 
 async def delete_working_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
@@ -228,10 +232,11 @@ def kb_debtors_list(debtors: List[Dict], is_employee: bool = False) -> InlineKey
         btn_text = f"{name} — {amount} ₽"
         rows.append([InlineKeyboardButton(btn_text, callback_data=f"debtor:{debtor['id']}")])
     
-    if is_employee:
-        rows.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="back:menu")])
-    else:
-        rows.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="back:menu")])
+    # Владельцы могут добавлять новые долги
+    if not is_employee:
+        rows.append([InlineKeyboardButton("➕ Внести долг", callback_data="debts:add")])
+    
+    rows.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="back:menu")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -251,6 +256,13 @@ def kb_film_payment() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🏢 Оплачено БН", callback_data="film_payment:bn")],
         [InlineKeyboardButton("📋 В долг", callback_data="film_payment:debt")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back:menu")],
+    ])
+
+
+def kb_debt_payment() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💵 Наличные", callback_data="debt_payment:cash")],
+        [InlineKeyboardButton("🏢 БН (QR и счёт)", callback_data="debt_payment:bn")],
     ])
 
 
@@ -1078,6 +1090,22 @@ async def debts_select_debtor(update: Update, context: ContextTypes.DEFAULT_TYPE
     await q.answer()
 
     user_id = update.effective_user.id
+    
+    # Если нажали "+ Внести долг"
+    if q.data == "debts:add":
+        debt_type = context.user_data.get("debt_type", "owe_me")
+        debt_label = "Долги перед Inside" if debt_type == "owe_me" else "Долги Inside"
+        
+        await q.edit_message_text(
+            f"<b>{debt_label}</b>\n\n"
+            f"➕ Внести новый долг\n\n"
+            f"Введи имя должника:",
+            parse_mode=ParseMode.HTML
+        )
+        context.user_data["working_message_id"] = q.message.message_id
+        return ST_DEBTS_ADD_NAME
+    
+    # Иначе - выбрали существующего должника
     debtor_id = int(q.data.split(":")[1])
     context.user_data["debtor_id"] = debtor_id
     
@@ -1110,7 +1138,6 @@ async def debts_select_debtor(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         text += "Выбери действие:"
     
-    await q.edit_message_text(text, reply_markup=kb_debtor_actions(is_employee), parse_mode=ParseMode.HTML)
     await q.edit_message_text(text, reply_markup=kb_debtor_actions(is_employee), parse_mode=ParseMode.HTML)
     return ST_DEBTS_SELECT
 
@@ -1188,6 +1215,165 @@ async def debts_amount_received(update: Update, context: ContextTypes.DEFAULT_TY
     
     txt = await main_screen_text_owner(user_id)
     await update.effective_chat.send_message(txt, reply_markup=kb_main_owner(), parse_mode=ParseMode.HTML)
+    
+    return ST_MENU
+
+
+async def debts_add_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return ConversationHandler.END
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    debtor_name = (update.message.text or "").strip()
+    
+    if not debtor_name:
+        await delete_working_message(context, update.effective_chat.id)
+        msg = await update.effective_chat.send_message("Имя обязательно! Напиши:")
+        context.user_data["working_message_id"] = msg.message_id
+        return ST_DEBTS_ADD_NAME
+    
+    context.user_data["new_debtor_name"] = debtor_name
+    
+    work_msg_id = context.user_data.get("working_message_id")
+    if work_msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=work_msg_id,
+                text=f"<b>{debtor_name}</b>\n\nВведи сумму долга:\n\nПримеры: <code>5000</code>, <code>5 000</code>, <code>5к</code>",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+    
+    return ST_DEBTS_ADD_AMOUNT
+
+
+async def debts_add_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return ConversationHandler.END
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    amt = parse_amount(update.message.text)
+    
+    if amt is None or amt <= 0:
+        await delete_working_message(context, update.effective_chat.id)
+        msg = await update.effective_chat.send_message(
+            "Не понял сумму 🙈\nНапиши, пожалуйста, например: 5000 / 5 000 / 5к"
+        )
+        context.user_data["working_message_id"] = msg.message_id
+        return ST_DEBTS_ADD_AMOUNT
+    
+    context.user_data["new_debtor_amount"] = amt
+    
+    work_msg_id = context.user_data.get("working_message_id")
+    debtor_name = context.user_data.get("new_debtor_name", "")
+    
+    if work_msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=work_msg_id,
+                text=f"<b>{debtor_name}</b>\nСумма: {amt:,.0f} ₽\n\nВыбери форму оплаты:".replace(",", " "),
+                reply_markup=kb_debt_payment(),
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+    
+    return ST_DEBTS_ADD_PAYMENT
+
+
+async def debts_add_payment_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    payment_choice = q.data.split(":")[1]
+    
+    if payment_choice == "cash":
+        payment_type = "Наличные"
+    else:  # bn
+        payment_type = "БН (QR и счёт)"
+    
+    context.user_data["new_debtor_payment"] = payment_type
+    
+    debtor_name = context.user_data.get("new_debtor_name", "")
+    amount = context.user_data.get("new_debtor_amount", 0)
+    
+    await q.edit_message_text(
+        f"<b>{debtor_name}</b>\n"
+        f"Сумма: {amount:,.0f} ₽\n"
+        f"Форма оплаты: {payment_type}\n\n"
+        f"Добавить комментарий?\n(или напиши <code>-</code> чтобы пропустить)".replace(",", " "),
+        parse_mode=ParseMode.HTML
+    )
+    context.user_data["working_message_id"] = q.message.message_id
+    
+    return ST_DEBTS_ADD_COMMENT
+
+
+async def debts_add_comment_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return ConversationHandler.END
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    user_id = update.effective_user.id
+    comment = (update.message.text or "").strip()
+    
+    if comment == "-":
+        comment = ""
+    
+    debtor_name = context.user_data.get("new_debtor_name", "")
+    amount = context.user_data.get("new_debtor_amount", 0)
+    debt_type = context.user_data.get("debt_type", "owe_me")
+    payment_type = context.user_data.get("new_debtor_payment", "Наличные")
+    
+    await delete_working_message(context, update.effective_chat.id)
+    
+    # Добавляем должника
+    payload = {
+        "cmd": "add_debtor",
+        "debtor_name": debtor_name,
+        "amount": amount,
+        "debt_type": debt_type,
+        "comment": comment,
+        "payment_type": payment_type
+    }
+    
+    try:
+        await gas_request(payload, user_id)
+        await update.effective_chat.send_message(
+            f"✅ Долг записан!\n"
+            f"<b>{debtor_name}</b>: {amount:,.0f} ₽".replace(",", " "),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        await update.effective_chat.send_message(f"Ошибка: {e}")
+    
+    # Показываем главный экран
+    if is_owner(user_id):
+        txt = await main_screen_text_owner(user_id)
+        kb = kb_main_owner()
+    else:
+        txt = await main_screen_text_employee(user_id)
+        kb = kb_main_employee()
+    
+    await update.effective_chat.send_message(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
     
     return ST_MENU
 
@@ -1335,7 +1521,7 @@ async def film_payment_selected(update: Update, context: ContextTypes.DEFAULT_TY
     await delete_working_message(context, update.effective_chat.id)
     
     if payment_choice == "debt":
-        # Добавляем в долг
+        # Добавляем в долг (по умолчанию Наличные)
         comment = f"Пленка {meters} м"
         
         payload = {
@@ -1343,7 +1529,8 @@ async def film_payment_selected(update: Update, context: ContextTypes.DEFAULT_TY
             "debtor_name": client,
             "amount": amount,
             "debt_type": "owe_me",
-            "comment": comment
+            "comment": comment,
+            "payment_type": "Наличные"
         }
         
         try:
@@ -1472,11 +1659,24 @@ def build_app() -> Application:
             ],
             ST_DEBTS_SELECT: [
                 CallbackQueryHandler(debts_select_debtor, pattern=r"^debtor:\d+$"),
+                CallbackQueryHandler(debts_select_debtor, pattern=r"^debts:add$"),
                 CallbackQueryHandler(debtor_action, pattern=r"^debtor:(edit|delete)$"),
                 CallbackQueryHandler(back_router, pattern=r"^back:"),
             ],
             ST_DEBTS_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, debts_amount_received),
+            ],
+            ST_DEBTS_ADD_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, debts_add_name_received),
+            ],
+            ST_DEBTS_ADD_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, debts_add_amount_received),
+            ],
+            ST_DEBTS_ADD_PAYMENT: [
+                CallbackQueryHandler(debts_add_payment_selected, pattern=r"^debt_payment:"),
+            ],
+            ST_DEBTS_ADD_COMMENT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, debts_add_comment_received),
             ],
             ST_FILM_CLIENT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, film_client_received),
