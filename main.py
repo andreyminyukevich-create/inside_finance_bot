@@ -165,7 +165,7 @@ def kb_income_categories(categories: List[str]) -> InlineKeyboardMarkup:
 def kb_payment_types(payment_types: List[str]) -> InlineKeyboardMarkup:
     rows = []
     for i, p in enumerate(payment_types):
-        emoji = "💵" if p == "Наличные" else ("📱" if p == "QR код" else "🏢")
+        emoji = "💵" if p == "Наличные" else "🏢"
         rows.append([InlineKeyboardButton(f"{emoji} {p}", callback_data=f"payment:{i}")])
     return InlineKeyboardMarkup(rows)
 
@@ -207,7 +207,6 @@ def kb_special_reports() -> InlineKeyboardMarkup:
 def kb_balance_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💵 Изменить наличные", callback_data="balance:cash")],
-        [InlineKeyboardButton("📱 Изменить QR", callback_data="balance:qr")],
         [InlineKeyboardButton("🏢 Изменить БН", callback_data="balance:bn")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back:menu")],
     ])
@@ -317,8 +316,7 @@ async def main_screen_text_owner(user_id: int) -> str:
         f"<b>{month}</b>\n\n"
         f"<b>💰 Баланс:</b>\n"
         f"💵 Наличные: <b>{balances.get('cash', 0):,.2f}</b> ₽\n"
-        f"📱 QR код: <b>{balances.get('qr', 0):,.2f}</b> ₽\n"
-        f"🏢 Безналичные: <b>{balances.get('bn', 0):,.2f}</b> ₽\n"
+        f"🏢 БН (QR и счёт): <b>{balances.get('bn', 0):,.2f}</b> ₽\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"💵 Всего: <b>{bal_total:,.2f}</b> ₽\n\n"
         f"➖ Расходы: <b>{exp:,.2f}</b> ₽\n"
@@ -367,6 +365,8 @@ async def main_screen_text_employee(user_id: int) -> str:
         text += "Пока нет операций"
     
     return text
+
+
 async def get_categories(user_id: int) -> Dict[str, Any]:
     return await gas_request({"cmd": "get_categories"}, user_id)
 
@@ -426,8 +426,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"<b>💰 Текущие балансы:</b>\n\n"
             f"💵 Наличные: <b>{balances.get('cash', 0):,.2f}</b> ₽\n"
-            f"📱 QR код: <b>{balances.get('qr', 0):,.2f}</b> ₽\n"
-            f"🏢 Безналичные: <b>{balances.get('bn', 0):,.2f}</b> ₽"
+            f"🏢 БН (QR и счёт): <b>{balances.get('bn', 0):,.2f}</b> ₽"
         ).replace(",", " ")
         
         await q.edit_message_text(text, reply_markup=kb_balance_menu(), parse_mode=ParseMode.HTML)
@@ -603,11 +602,7 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         if work_msg_id:
             try:
-                category = tx.get("category", "")
-                if category == "Услуги по БН":
-                    text = "Напиши название Юр лица:"
-                else:
-                    text = "Напиши ФИО клиента или марку авто:"
+                text = "Напиши ФИО клиента или марку авто:"
                 
                 await context.bot.edit_message_text(
                     chat_id=update.effective_chat.id,
@@ -664,13 +659,7 @@ async def comment_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if tx.get("type") == "доход" and not comment_text:
         await delete_working_message(context, update.effective_chat.id)
-        
-        category = tx.get("category", "")
-        if category == "Услуги по БН":
-            prompt = "Название Юр лица обязательно! Напиши:"
-        else:
-            prompt = "ФИО или марка авто обязательны! Напиши:"
-        
+        prompt = "ФИО или марка авто обязательны! Напиши:"
         msg = await update.effective_chat.send_message(prompt)
         context.user_data["working_message_id"] = msg.message_id
         return ST_COMMENT
@@ -786,7 +775,7 @@ async def analysis_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if total > 0:
             for payment_type, amount in by_type.items():
                 percentage = (amount / total) * 100
-                emoji = "💵" if payment_type == "Наличные" else ("📱" if payment_type == "QR код" else "🏢")
+                emoji = "💵" if payment_type == "Наличные" else "🏢"
                 text += f"{emoji} {payment_type}: <b>{amount:,.0f}</b> ₽ ({percentage:.0f}%)\n"
             text += f"━━━━━━━━━━━━━━━━\nИтого: <b>{total:,.0f}</b> ₽"
         else:
@@ -928,8 +917,7 @@ async def balance_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     labels = {
         "cash": "наличных",
-        "qr": "QR счета",
-        "bn": "безналичного счета"
+        "bn": "БН счета"
     }
     label = labels.get(payment_type, "")
 
@@ -969,8 +957,7 @@ async def balance_edit_received(update: Update, context: ContextTypes.DEFAULT_TY
 
     labels = {
         "cash": "наличных",
-        "qr": "QR счета",
-        "bn": "безналичного счета"
+        "bn": "БН счета"
     }
     label = labels.get(payment_type, "")
 
@@ -1089,7 +1076,7 @@ def build_app() -> Application:
         states={
             ST_MENU: [
                 CallbackQueryHandler(on_menu, pattern=r"^menu:"),
-                CallbackQueryHandler(balance_edit_start, pattern=r"^balance:(cash|qr|bn)$"),
+                CallbackQueryHandler(balance_edit_start, pattern=r"^balance:(cash|bn)$"),
             ],
             ST_ADD_CHOOSE_TYPE: [
                 CallbackQueryHandler(choose_type, pattern=r"^type:"),
