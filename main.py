@@ -132,7 +132,7 @@ def kb_main_owner() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("💰 Долги перед Inside", callback_data="menu:debts_owe_us")],
         [InlineKeyboardButton("💳 Долги Inside", callback_data="menu:debts_we_owe")],
         [InlineKeyboardButton("📊 Анализ", callback_data="menu:analysis")],
-        [InlineKeyboardButton("💵 Сверить баланс", callback_data="menu:balance")],
+        [InlineKeyboardButton("⚙️ Корректировать баланс", callback_data="menu:balance")],
     ])
 
 
@@ -218,8 +218,8 @@ def kb_special_reports() -> InlineKeyboardMarkup:
 
 def kb_balance_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💵 Изменить наличные", callback_data="balance:cash")],
-        [InlineKeyboardButton("🏢 Изменить БН", callback_data="balance:bn")],
+        [InlineKeyboardButton("💵 Корректировать наличные", callback_data="balance:cash")],
+        [InlineKeyboardButton("🏢 Корректировать БН", callback_data="balance:bn")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back:menu")],
     ])
 
@@ -347,22 +347,38 @@ async def main_screen_text_owner(user_id: int) -> str:
     bal_month = s.get("balance_month", 0)
     balances = s.get("balances", {})
     bal_total = s.get("balance_total", 0)
-    debts_owe_me = s.get("debts_owe_me", 0)
-    debts_i_owe = s.get("debts_i_owe", 0)
+    
+    # Получаем долги с разбивкой по форме оплаты
+    debts_data = await gas_request({"cmd": "get_debts_balance"}, user_id)
+    owe_us_cash = debts_data.get("owe_us_cash", 0)  # Нам должны наличными
+    owe_us_bn = debts_data.get("owe_us_bn", 0)     # Нам должны БН
+    we_owe_cash = debts_data.get("we_owe_cash", 0) # Мы должны наличными
+    we_owe_bn = debts_data.get("we_owe_bn", 0)     # Мы должны БН
+    
+    # Рассчитываем балансы с учетом долгов
+    cash_balance = balances.get('cash', 0)
+    bn_balance = balances.get('bn', 0)
+    
+    cash_with_debts = cash_balance + owe_us_cash - we_owe_cash
+    bn_with_debts = bn_balance + owe_us_bn - we_owe_bn
+    total_with_debts = cash_with_debts + bn_with_debts
     
     text = (
         f"<b>💼 Бизнес</b>\n"
         f"<b>{month}</b>\n\n"
         f"<b>💰 Баланс:</b>\n"
-        f"💵 Наличные: <b>{balances.get('cash', 0):,.2f}</b> ₽\n"
-        f"🏢 БН (QR и счёт): <b>{balances.get('bn', 0):,.2f}</b> ₽\n"
+        f"💵 Наличные: <b>{cash_balance:,.2f}</b> ₽\n"
+        f"🏢 БН (QR и счёт): <b>{bn_balance:,.2f}</b> ₽\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"💵 Всего: <b>{bal_total:,.2f}</b> ₽\n\n"
+        f"<b>💰 Баланс с учетом долгов:</b>\n"
+        f"💵 Наличные: <b>{cash_with_debts:,.2f}</b> ₽\n"
+        f"🏢 БН (QR и счёт): <b>{bn_with_debts:,.2f}</b> ₽\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"💵 Всего: <b>{total_with_debts:,.2f}</b> ₽\n\n"
         f"➖ Расходы: <b>{exp:,.2f}</b> ₽\n"
         f"➕ Доходы: <b>{inc:,.2f}</b> ₽\n"
         f"🟰 За месяц: <b>{bal_month:,.2f}</b> ₽\n"
-        f"💳 Мои долги: <b>{debts_i_owe:,.2f}</b> ₽\n"
-        f"💰 Долги передо мной: <b>{debts_owe_me:,.2f}</b> ₽\n"
     ).replace(",", " ")
     
     transactions = s.get("transactions", [])
@@ -470,9 +486,12 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         balances = await gas_request({"cmd": "get_all_balances"}, user_id)
         
         text = (
-            f"<b>💰 Текущие балансы:</b>\n\n"
+            f"<b>⚙️ Корректировать баланс</b>\n\n"
+            f"Текущие значения:\n"
             f"💵 Наличные: <b>{balances.get('cash', 0):,.2f}</b> ₽\n"
-            f"🏢 БН (QR и счёт): <b>{balances.get('bn', 0):,.2f}</b> ₽"
+            f"🏢 БН (QR и счёт): <b>{balances.get('bn', 0):,.2f}</b> ₽\n\n"
+            f"Установи новое базовое значение баланса.\n"
+            f"Все последующие транзакции будут изменять его."
         ).replace(",", " ")
         
         await q.edit_message_text(text, reply_markup=kb_balance_menu(), parse_mode=ParseMode.HTML)
@@ -1030,13 +1049,16 @@ async def balance_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     labels = {
         "cash": "наличных",
-        "bn": "БН счета"
+        "bn": "БН"
     }
     label = labels.get(payment_type, "")
 
     await q.edit_message_text(
-        f"Какой у тебя баланс {label}? 💰\n\n"
-        f"Напиши сумму (например: 50000 или 50к)",
+        f"⚙️ <b>Корректировка баланса {label}</b>\n\n"
+        f"Введи новое значение баланса:\n"
+        f"(например: 102000 или 102к)\n\n"
+        f"С этого момента все транзакции будут\n"
+        f"изменять именно это значение.",
         parse_mode=ParseMode.HTML
     )
     context.user_data["working_message_id"] = q.message.message_id
