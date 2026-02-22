@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import random
 import logging
 import hashlib
@@ -29,31 +30,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger("detailing-finance-bot")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-SCRIPT_URL = os.getenv("SCRIPT_URL", "").strip()
-
-USER_TG_IDS_STR = os.getenv("USER_TG_IDS", "").strip()
-if USER_TG_IDS_STR:
-    USER_TG_IDS = [int(x.strip()) for x in USER_TG_IDS_STR.split(",") if x.strip()]
-else:
-    USER_TG_IDS = []
-
-OWNER_IDS_STR = os.getenv("OWNER_IDS", "").strip()
-if OWNER_IDS_STR:
-    OWNER_IDS = [int(x.strip()) for x in OWNER_IDS_STR.split(",") if x.strip()]
-else:
-    OWNER_IDS = []
-
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
-PORT = int(os.getenv("PORT", "8080"))
+BOT_TOKEN   = os.getenv("BOT_TOKEN", "").strip()
+SCRIPT_URL  = os.getenv("SCRIPT_URL", "").strip()
+WEBHOOK_URL  = os.getenv("WEBHOOK_URL", "").strip()
+PORT         = int(os.getenv("PORT", "8080"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "").strip()
+
+# Единый аккаунт студии — для всех балансовых операций
+STUDIO_ACCOUNT_ID = int(os.getenv("STUDIO_ACCOUNT_ID", "419675968"))
+
+def _parse_ids(env_var: str) -> List[int]:
+    val = os.getenv(env_var, "").strip()
+    return [int(x.strip()) for x in val.split(",") if x.strip()] if val else []
+
+OWNER_IDS = _parse_ids("OWNER_IDS")
+ADMIN_IDS = _parse_ids("ADMIN_IDS")
+
+# Общий allowlist
+USER_TG_IDS = list(set(OWNER_IDS + ADMIN_IDS))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 if not SCRIPT_URL:
     raise RuntimeError("SCRIPT_URL is missing")
 if not USER_TG_IDS:
-    raise RuntimeError("USER_TG_IDS is missing")
+    raise RuntimeError("OWNER_IDS и ADMIN_IDS не заданы")
 
 
 def _default_webhook_path() -> str:
@@ -61,6 +62,30 @@ def _default_webhook_path() -> str:
     return f"tg/{h[:24]}"
 
 
+# ========================================
+# РОЛИ
+# ========================================
+def get_role(user_id: int) -> str:
+    """Возвращает 'owner' | 'admin'"""
+    if user_id in OWNER_IDS:
+        return "owner"
+    return "admin"
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id in OWNER_IDS
+
+
+def is_allowed(update: Update) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    return user.id in USER_TG_IDS
+
+
+# ========================================
+# ФРАЗЫ
+# ========================================
 PH_SAVED_INCOME = [
     "Отлично! ✅ Записал поступление.",
     "Есть! ✅ Зафиксировал.",
@@ -78,6 +103,9 @@ PH_SAVED_EXPENSE = [
 
 DENY_TEXT = "Извини, доступ закрыт 🙂"
 
+# ========================================
+# СОСТОЯНИЯ
+# ========================================
 (
     ST_MENU,
     ST_ADD_CHOOSE_TYPE,
@@ -104,6 +132,9 @@ DENY_TEXT = "Извини, доступ закрыт 🙂"
 ) = range(22)
 
 
+# ========================================
+# ВСПОМОГАТЕЛЬНЫЕ
+# ========================================
 async def delete_working_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     msg_id = context.user_data.get("working_message_id")
     if msg_id:
@@ -114,47 +145,38 @@ async def delete_working_message(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     context.user_data["working_message_id"] = None
 
 
-def is_allowed(update: Update) -> bool:
-    user = update.effective_user
-    if not user:
-        return False
-    return user.id in USER_TG_IDS
-
-
-def is_owner(user_id: int) -> bool:
-    return user_id in OWNER_IDS
-
-
+# ========================================
+# КЛАВИАТУРЫ
+# ========================================
 def kb_main_owner() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Внести транзакцию", callback_data="menu:add")],
-        [InlineKeyboardButton("📦 Продал пленку", callback_data="menu:film")],
-        [InlineKeyboardButton("💰 Долги перед Inside", callback_data="menu:debts_owe_us")],
-        [InlineKeyboardButton("💳 Долги Inside", callback_data="menu:debts_we_owe")],
-        [InlineKeyboardButton("📊 Анализ", callback_data="menu:analysis")],
+        [InlineKeyboardButton("➕ Внести транзакцию",    callback_data="menu:add")],
+        [InlineKeyboardButton("📦 Продал пленку",         callback_data="menu:film")],
+        [InlineKeyboardButton("💰 Долги перед Inside",    callback_data="menu:debts_owe_us")],
+        [InlineKeyboardButton("💳 Долги Inside",          callback_data="menu:debts_we_owe")],
+        [InlineKeyboardButton("📊 Анализ",               callback_data="menu:analysis")],
         [InlineKeyboardButton("⚙️ Корректировать баланс", callback_data="menu:balance")],
     ])
 
 
-def kb_main_employee() -> InlineKeyboardMarkup:
+def kb_main_admin() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Внести транзакцию", callback_data="menu:add")],
-        [InlineKeyboardButton("📦 Продал пленку", callback_data="menu:film")],
+        [InlineKeyboardButton("📦 Продал пленку",     callback_data="menu:film")],
         [InlineKeyboardButton("💰 Долги перед Inside", callback_data="menu:debts_owe_us")],
     ])
 
 
 def kb_choose_type() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➖ Затраты", callback_data="type:expense")],
-        [InlineKeyboardButton("➕ Доход", callback_data="type:income")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back:menu")],
+        [InlineKeyboardButton("➖ Затраты",  callback_data="type:expense")],
+        [InlineKeyboardButton("➕ Доход",    callback_data="type:income")],
+        [InlineKeyboardButton("⬅️ Назад",    callback_data="back:menu")],
     ])
 
 
 def kb_expense_categories(categories: List[str]) -> InlineKeyboardMarkup:
-    rows = []
-    row = []
+    rows, row = [], []
     for i, c in enumerate(categories):
         row.append(InlineKeyboardButton(c, callback_data=f"expcat:{i}"))
         if len(row) == 2:
@@ -167,9 +189,7 @@ def kb_expense_categories(categories: List[str]) -> InlineKeyboardMarkup:
 
 
 def kb_income_categories(categories: List[str]) -> InlineKeyboardMarkup:
-    rows = []
-    for i, c in enumerate(categories):
-        rows.append([InlineKeyboardButton(c, callback_data=f"inccat:{i}")])
+    rows = [[InlineKeyboardButton(c, callback_data=f"inccat:{i}")] for i, c in enumerate(categories)]
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back:choose_type")])
     return InlineKeyboardMarkup(rows)
 
@@ -190,62 +210,63 @@ def kb_skip_comment() -> InlineKeyboardMarkup:
 
 def kb_analysis_periods() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Сегодня", callback_data="aperiod:today")],
-        [InlineKeyboardButton("📅 Эта неделя", callback_data="aperiod:week")],
-        [InlineKeyboardButton("📅 Этот месяц", callback_data="aperiod:month")],
-        [InlineKeyboardButton("📅 Этот год", callback_data="aperiod:year")],
-        [InlineKeyboardButton("⚙️ Специальные отчеты", callback_data="aperiod:special")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back:menu")],
+        [InlineKeyboardButton("📅 Сегодня",              callback_data="aperiod:today")],
+        [InlineKeyboardButton("📅 Эта неделя",           callback_data="aperiod:week")],
+        [InlineKeyboardButton("📅 Этот месяц",           callback_data="aperiod:month")],
+        [InlineKeyboardButton("📅 Этот год",             callback_data="aperiod:year")],
+        [InlineKeyboardButton("⚙️ Специальные отчеты",  callback_data="aperiod:special")],
+        [InlineKeyboardButton("⬅️ Назад",                callback_data="back:menu")],
     ])
 
 
 def kb_analysis_type() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Поступления", callback_data="atype:income")],
-        [InlineKeyboardButton("💸 Затраты", callback_data="atype:expense")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back:analysis_periods")],
+        [InlineKeyboardButton("💰 Поступления",  callback_data="atype:income")],
+        [InlineKeyboardButton("💸 Затраты",      callback_data="atype:expense")],
+        [InlineKeyboardButton("⬅️ Назад",        callback_data="back:analysis_periods")],
     ])
 
 
 def kb_special_reports() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Сравнение месяцев", callback_data="special:compare")],
-        [InlineKeyboardButton("💰 Средний чек", callback_data="special:average")],
+        [InlineKeyboardButton("📊 Сравнение месяцев",    callback_data="special:compare")],
+        [InlineKeyboardButton("💰 Средний чек",          callback_data="special:average")],
         [InlineKeyboardButton("📋 Топ категорий затрат", callback_data="special:top")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back:analysis_periods")],
+        [InlineKeyboardButton("⬅️ Назад",                callback_data="back:analysis_periods")],
     ])
 
 
 def kb_balance_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💵 Корректировать наличные", callback_data="balance:cash")],
-        [InlineKeyboardButton("🏢 Корректировать БН", callback_data="balance:bn")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back:menu")],
+        [InlineKeyboardButton("🏢 Корректировать БН",       callback_data="balance:bn")],
+        [InlineKeyboardButton("⬅️ Назад",                   callback_data="back:menu")],
     ])
 
 
-def kb_debtors_list(debtors: List[Dict], is_employee: bool = False) -> InlineKeyboardMarkup:
+def kb_debtors_list(debtors: List[Dict], owner_mode: bool = True) -> InlineKeyboardMarkup:
     rows = []
     for debtor in debtors:
-        name = debtor["name"]
+        name   = debtor["name"]
         amount = f"{debtor['amount']:,.0f}".replace(",", " ")
-        btn_text = f"{name} — {amount} ₽"
-        rows.append([InlineKeyboardButton(btn_text, callback_data=f"debtor:{debtor['id']}")])
-    
-    # Владельцы могут добавлять новые долги
-    if not is_employee:
+        rows.append([InlineKeyboardButton(
+            f"{name} — {amount} ₽",
+            callback_data=f"debtor:{debtor['id']}"
+        )])
+    if owner_mode:
         rows.append([InlineKeyboardButton("➕ Внести долг", callback_data="debts:add")])
-    
     rows.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="back:menu")])
     return InlineKeyboardMarkup(rows)
 
 
-def kb_debtor_actions(is_employee: bool = False) -> InlineKeyboardMarkup:
+def kb_debtor_actions(owner_mode: bool = True) -> InlineKeyboardMarkup:
     rows = []
-    if not is_employee:
-        # Владельцы могут редактировать и удалять
+    if owner_mode:
         rows.append([InlineKeyboardButton("✏️ Изменить сумму", callback_data="debtor:edit")])
-        rows.append([InlineKeyboardButton("🗑 Удалить", callback_data="debtor:delete")])
+        rows.append([InlineKeyboardButton("🗑 Удалить",         callback_data="debtor:delete")])
+    # Admin может закрыть долг (изменить сумму)
+    else:
+        rows.append([InlineKeyboardButton("✏️ Закрыть / изменить", callback_data="debtor:edit")])
     rows.append([InlineKeyboardButton("⬅️ Назад к списку", callback_data="back:debtors_list")])
     return InlineKeyboardMarkup(rows)
 
@@ -253,65 +274,65 @@ def kb_debtor_actions(is_employee: bool = False) -> InlineKeyboardMarkup:
 def kb_film_payment() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💵 Оплачено наличными", callback_data="film_payment:cash")],
-        [InlineKeyboardButton("🏢 Оплачено БН", callback_data="film_payment:bn")],
-        [InlineKeyboardButton("📋 В долг", callback_data="film_payment:debt")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back:menu")],
+        [InlineKeyboardButton("🏢 Оплачено БН",        callback_data="film_payment:bn")],
+        [InlineKeyboardButton("📋 В долг",             callback_data="film_payment:debt")],
+        [InlineKeyboardButton("⬅️ Назад",              callback_data="back:menu")],
     ])
 
 
 def kb_debt_payment() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💵 Наличные", callback_data="debt_payment:cash")],
+        [InlineKeyboardButton("💵 Наличные",     callback_data="debt_payment:cash")],
         [InlineKeyboardButton("🏢 БН (QR и счёт)", callback_data="debt_payment:bn")],
     ])
 
 
+# ========================================
+# ПАРСИНГ СУММЫ
+# ========================================
 def parse_amount(text: str) -> Optional[float]:
     if not text:
         return None
     s0 = text.strip().lower()
-
     mult = 1.0
     s = re.sub(r"\s+", "", s0)
     if s.endswith("к") or s.endswith("k"):
         mult = 1000.0
         s = s[:-1]
-
     has_comma = "," in s
-    has_dot = "." in s
-
+    has_dot   = "." in s
     if has_comma and has_dot:
         last_comma = s.rfind(",")
-        last_dot = s.rfind(".")
-        dec_pos = max(last_comma, last_dot)
-        int_part = re.sub(r"[.,]", "", s[:dec_pos])
-        frac_part = re.sub(r"[.,]", "", s[dec_pos + 1:])
+        last_dot   = s.rfind(".")
+        dec_pos    = max(last_comma, last_dot)
+        int_part   = re.sub(r"[.,]", "", s[:dec_pos])
+        frac_part  = re.sub(r"[.,]", "", s[dec_pos + 1:])
         s = f"{int_part}.{frac_part}"
     elif has_comma and not has_dot:
         s = s.replace(",", ".")
-    else:
-        pass
-
     s = re.sub(r"[^0-9.\-]", "", s)
     try:
         val = float(s) * mult
-        if val < 0:
-            return None
-        return round(val, 2)
+        return None if val < 0 else round(val, 2)
     except Exception:
         return None
 
 
+# ========================================
+# GAS ЗАПРОСЫ
+# ========================================
 async def gas_request(payload: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     payload = dict(payload)
-    payload["user_id"] = user_id
+    payload["user_id"]    = user_id
+    payload["actor_id"]   = user_id          # кто совершил действие
+    payload["account_id"] = STUDIO_ACCOUNT_ID  # единый контур студии
 
-    timeout = aiohttp.ClientTimeout(total=12)
+    timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(SCRIPT_URL, json=payload) as resp:
             txt = await resp.text()
             try:
-                data = await resp.json()
+                data = json.loads(txt)
             except Exception:
                 logger.error("GAS non-json response: %s", txt)
                 raise RuntimeError("GAS вернул не-JSON ответ")
@@ -320,49 +341,51 @@ async def gas_request(payload: Dict[str, Any], user_id: int) -> Dict[str, Any]:
             return data["data"]
 
 
+# ========================================
+# ФОРМАТИРОВАНИЕ ТРАНЗАКЦИЙ
+# ========================================
 def format_transaction(tx: Dict) -> str:
     type_emoji = "➕" if tx["type"] == "доход" else "➖"
     amount_str = f"{tx['amount']:,.0f} ₽".replace(",", " ")
-    
     if tx["type"] == "доход":
-        comment = tx.get("comment", "")
+        comment  = tx.get("comment", "")
         category = tx.get("category", "")
         return f"{type_emoji} {amount_str} — {comment} — {category}"
     else:
-        category = tx.get("category", "")
+        category     = tx.get("category", "")
         payment_type = tx.get("payment_type", "")
-        comment = tx.get("comment", "")
+        comment      = tx.get("comment", "")
         if comment:
             return f"{type_emoji} {amount_str} — {category} — {payment_type} — {comment}"
-        else:
-            return f"{type_emoji} {amount_str} — {category} — {payment_type}"
+        return f"{type_emoji} {amount_str} — {category} — {payment_type}"
 
 
+# ========================================
+# ГЛАВНЫЕ ЭКРАНЫ
+# ========================================
 async def main_screen_text_owner(user_id: int) -> str:
-    s = await gas_request({"cmd": "get_main_screen", "limit": 5}, user_id)
-    
-    month = s.get("month_label", "Текущий месяц")
-    exp = s.get("expenses", 0)
-    inc = s.get("incomes", 0)
-    bal_month = s.get("balance_month", 0)
-    balances = s.get("balances", {})
-    bal_total = s.get("balance_total", 0)
-    
-    # Получаем долги с разбивкой по форме оплаты
-    debts_data = await gas_request({"cmd": "get_debts_balance"}, user_id)
-    owe_us_cash = debts_data.get("owe_us_cash", 0)  # Нам должны наличными
-    owe_us_bn = debts_data.get("owe_us_bn", 0)     # Нам должны БН
-    we_owe_cash = debts_data.get("we_owe_cash", 0) # Мы должны наличными
-    we_owe_bn = debts_data.get("we_owe_bn", 0)     # Мы должны БН
-    
-    # Рассчитываем балансы с учетом долгов
-    cash_balance = balances.get('cash', 0)
-    bn_balance = balances.get('bn', 0)
-    
-    cash_with_debts = cash_balance + owe_us_cash - we_owe_cash
-    bn_with_debts = bn_balance + owe_us_bn - we_owe_bn
+    s = await gas_request({"cmd": "get_main_screen", "view": "owner", "limit": 5}, user_id)
+
+    month      = s.get("month_label", "Текущий месяц")
+    exp        = s.get("expenses", 0)
+    inc        = s.get("incomes", 0)
+    bal_month  = s.get("balance_month", 0)
+    balances   = s.get("balances", {})
+    bal_total  = s.get("balance_total", 0)
+    debts      = s.get("debts", {})
+
+    cash_balance = balances.get("cash", 0)
+    bn_balance   = balances.get("bn", 0)
+
+    owe_us_cash = debts.get("owe_us_cash", 0)
+    owe_us_bn   = debts.get("owe_us_bn", 0)
+    we_owe_cash = debts.get("we_owe_cash", 0)
+    we_owe_bn   = debts.get("we_owe_bn", 0)
+
+    cash_with_debts  = cash_balance + owe_us_cash - we_owe_cash
+    bn_with_debts    = bn_balance   + owe_us_bn   - we_owe_bn
     total_with_debts = cash_with_debts + bn_with_debts
-    
+
     text = (
         f"<b>💼 Бизнес</b>\n"
         f"<b>{month}</b>\n\n"
@@ -371,7 +394,7 @@ async def main_screen_text_owner(user_id: int) -> str:
         f"🏢 БН (QR и счёт): <b>{bn_balance:,.2f}</b> ₽\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"💵 Всего: <b>{bal_total:,.2f}</b> ₽\n\n"
-        f"<b>💰 Баланс с учетом долгов:</b>\n"
+        f"<b>💰 Баланс с учётом долгов:</b>\n"
         f"💵 Наличные: <b>{cash_with_debts:,.2f}</b> ₽\n"
         f"🏢 БН (QR и счёт): <b>{bn_with_debts:,.2f}</b> ₽\n"
         f"━━━━━━━━━━━━━━━━\n"
@@ -380,70 +403,68 @@ async def main_screen_text_owner(user_id: int) -> str:
         f"➕ Доходы: <b>{inc:,.2f}</b> ₽\n"
         f"🟰 За месяц: <b>{bal_month:,.2f}</b> ₽\n"
     ).replace(",", " ")
-    
+
     transactions = s.get("transactions", [])
     if transactions:
         text += "\n<b>📋 Последние 5 операций:</b>\n\n"
         for tx in transactions[:5]:
             text += format_transaction(tx) + "\n"
-    
+
     return text
 
 
-async def main_screen_text_employee(user_id: int) -> str:
-    from datetime import datetime
-    
-    s = await gas_request({"cmd": "get_main_screen", "limit": 10}, user_id)
-    
-    now = datetime.now()
-    date_str = now.strftime("%d %B %Y").replace(
-        "January", "января"
-    ).replace("February", "февраля").replace("March", "марта").replace(
-        "April", "апреля"
-    ).replace("May", "мая").replace("June", "июня").replace(
-        "July", "июля"
-    ).replace("August", "августа").replace("September", "сентября").replace(
-        "October", "октября"
-    ).replace("November", "ноября").replace("December", "декабря")
-    
+async def main_screen_text_admin(user_id: int) -> str:
+    s = await gas_request({"cmd": "get_main_screen", "view": "admin", "limit": 10}, user_id)
+
+    month        = s.get("month_label", "Текущий месяц")
+    month_income = s.get("month_income", 0)
+    checks_count = s.get("checks_count", 0)
+
     text = (
         f"<b>💼 Касса детейлинг-студии</b>\n"
-        f"{date_str}\n\n"
-        f"<b>📋 Последние 10 операций:</b>\n\n"
-    )
-    
+        f"<b>{month}</b>\n\n"
+        f"🧾 Чеков за месяц: <b>{checks_count}</b>\n"
+        f"➕ Оборот: <b>{month_income:,.2f}</b> ₽\n"
+    ).replace(",", " ")
+
     transactions = s.get("transactions", [])
     if transactions:
+        text += "\n<b>📋 Последние 10 твоих операций:</b>\n\n"
         for tx in transactions[:10]:
             text += format_transaction(tx) + "\n"
     else:
-        text += "Пока нет операций"
-    
+        text += "\nПока нет операций"
+
     return text
+
+
+async def get_main_screen(user_id: int):
+    """Возвращает (text, keyboard) в зависимости от роли."""
+    if is_owner(user_id):
+        txt = await main_screen_text_owner(user_id)
+        kb  = kb_main_owner()
+    else:
+        txt = await main_screen_text_admin(user_id)
+        kb  = kb_main_admin()
+    return txt, kb
 
 
 async def get_categories(user_id: int) -> Dict[str, Any]:
     return await gas_request({"cmd": "get_categories"}, user_id)
 
 
+# ========================================
+# HANDLERS: START / MENU
+# ========================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
         return ConversationHandler.END
 
     context.user_data.clear()
-    
     user_id = update.effective_user.id
-    
-    if is_owner(user_id):
-        txt = await main_screen_text_owner(user_id)
-        kb = kb_main_owner()
-    else:
-        txt = await main_screen_text_employee(user_id)
-        kb = kb_main_employee()
-    
+    txt, kb = await get_main_screen(user_id)
     await update.message.reply_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-    
     return ST_MENU
 
 
@@ -453,10 +474,10 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text(DENY_TEXT)
         return ConversationHandler.END
 
-    q = update.callback_query
+    q       = update.callback_query
     await q.answer()
-    
     user_id = update.effective_user.id
+    role    = get_role(user_id)
 
     if q.data == "menu:add":
         await q.edit_message_text("Окей 🙂 Что вносим?", reply_markup=kb_choose_type())
@@ -482,9 +503,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_owner(user_id):
             await q.answer("Доступ запрещён", show_alert=True)
             return ST_MENU
-        
         balances = await gas_request({"cmd": "get_all_balances"}, user_id)
-        
         text = (
             f"<b>⚙️ Корректировать баланс</b>\n\n"
             f"Текущие значения:\n"
@@ -493,84 +512,72 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Установи новое базовое значение баланса.\n"
             f"Все последующие транзакции будут изменять его."
         ).replace(",", " ")
-        
         await q.edit_message_text(text, reply_markup=kb_balance_menu(), parse_mode=ParseMode.HTML)
         context.user_data["working_message_id"] = q.message.message_id
         return ST_MENU
 
     if q.data == "menu:debts_owe_us":
-        # Долги перед Inside - доступно ВСЕМ
         debt_type = "owe_me"
         context.user_data["debt_type"] = debt_type
-        
         debtors = await gas_request({"cmd": "get_debtors_list", "debt_type": debt_type}, user_id)
-        
+
         text = "<b>💰 Долги перед Inside</b>\n\n"
-        
         if debtors.get("debtors"):
-            for debtor in debtors["debtors"]:
-                name = debtor["name"]
-                amount = debtor["amount"]
-                text += f"• {name}: <b>{amount:,.2f}</b> ₽\n"
+            for d in debtors["debtors"]:
+                text += f"• {d['name']}: <b>{d['amount']:,.2f}</b> ₽\n"
             text += f"\n━━━━━━━━━━━━━━━━\nВсего: <b>{debtors.get('total', 0):,.2f}</b> ₽"
         else:
             text += "Список пуст"
-        
         text = text.replace(",", " ")
-        
-        is_employee = not is_owner(user_id)
-        
-        await q.edit_message_text(text, reply_markup=kb_debtors_list(debtors.get("debtors", []), is_employee), parse_mode=ParseMode.HTML)
+
+        owner_mode = is_owner(user_id)
+        await q.edit_message_text(
+            text,
+            reply_markup=kb_debtors_list(debtors.get("debtors", []), owner_mode),
+            parse_mode=ParseMode.HTML
+        )
         context.user_data["working_message_id"] = q.message.message_id
         return ST_DEBTS_SELECT
 
     if q.data == "menu:debts_we_owe":
-        # Долги Inside - только для ВЛАДЕЛЬЦЕВ
         if not is_owner(user_id):
             await q.answer("Доступ запрещён", show_alert=True)
             return ST_MENU
-        
         debt_type = "i_owe"
         context.user_data["debt_type"] = debt_type
-        
         debtors = await gas_request({"cmd": "get_debtors_list", "debt_type": debt_type}, user_id)
-        
+
         text = "<b>💳 Долги Inside</b>\n\n"
-        
         if debtors.get("debtors"):
-            for debtor in debtors["debtors"]:
-                name = debtor["name"]
-                amount = debtor["amount"]
-                text += f"• {name}: <b>{amount:,.2f}</b> ₽\n"
+            for d in debtors["debtors"]:
+                text += f"• {d['name']}: <b>{d['amount']:,.2f}</b> ₽\n"
             text += f"\n━━━━━━━━━━━━━━━━\nВсего: <b>{debtors.get('total', 0):,.2f}</b> ₽"
         else:
             text += "Список пуст"
-        
         text = text.replace(",", " ")
-        
-        await q.edit_message_text(text, reply_markup=kb_debtors_list(debtors.get("debtors", []), False), parse_mode=ParseMode.HTML)
+
+        await q.edit_message_text(
+            text,
+            reply_markup=kb_debtors_list(debtors.get("debtors", []), True),
+            parse_mode=ParseMode.HTML
+        )
         context.user_data["working_message_id"] = q.message.message_id
         return ST_DEBTS_SELECT
 
     return ST_MENU
 
 
+# ========================================
+# BACK ROUTER
+# ========================================
 async def back_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q       = update.callback_query
     await q.answer()
-    
     user_id = update.effective_user.id
 
     if q.data == "back:menu":
         await delete_working_message(context, update.effective_chat.id)
-        
-        if is_owner(user_id):
-            txt = await main_screen_text_owner(user_id)
-            kb = kb_main_owner()
-        else:
-            txt = await main_screen_text_employee(user_id)
-            kb = kb_main_employee()
-        
+        txt, kb = await get_main_screen(user_id)
         await update.effective_chat.send_message(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
         return ST_MENU
 
@@ -579,9 +586,11 @@ async def back_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ST_ADD_CHOOSE_TYPE
 
     if q.data == "back:exp_cat":
-        user_id = update.effective_user.id
         categories = await get_categories(user_id)
-        await q.edit_message_text("На что потратили? 💪", reply_markup=kb_expense_categories(categories["expenses"]))
+        await q.edit_message_text(
+            "На что потратили? 💪",
+            reply_markup=kb_expense_categories(categories["expenses"])
+        )
         return ST_EXP_CATEGORY
 
     if q.data == "back:analysis_periods":
@@ -589,54 +598,48 @@ async def back_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ST_ANALYSIS_PERIOD
 
     if q.data == "back:analysis_type":
-        period_labels = {
-            "today": "Сегодня",
-            "week": "Эта неделя",
-            "month": "Этот месяц",
-            "year": "Этот год"
-        }
-        period = context.user_data.get("analysis_period", "month")
+        period_labels = {"today": "Сегодня", "week": "Эта неделя", "month": "Этот месяц", "year": "Этот год"}
+        period       = context.user_data.get("analysis_period", "month")
         period_label = period_labels.get(period, period)
         await q.edit_message_text(f"📊 {period_label}\n\nЧто посмотрим?", reply_markup=kb_analysis_type())
         return ST_ANALYSIS_TYPE
 
     if q.data == "back:debtors_list":
-        user_id = update.effective_user.id
         debt_type = context.user_data.get("debt_type", "owe_me")
-        debtors = await gas_request({"cmd": "get_debtors_list", "debt_type": debt_type}, user_id)
-        
+        debtors   = await gas_request({"cmd": "get_debtors_list", "debt_type": debt_type}, user_id)
+
         if debt_type == "owe_me":
             text = "<b>💰 Долги перед Inside</b>\n\n"
         else:
             text = "<b>💳 Долги Inside</b>\n\n"
-        
+
         if debtors.get("debtors"):
-            for debtor in debtors["debtors"]:
-                name = debtor["name"]
-                amount = debtor["amount"]
-                text += f"• {name}: <b>{amount:,.2f}</b> ₽\n"
+            for d in debtors["debtors"]:
+                text += f"• {d['name']}: <b>{d['amount']:,.2f}</b> ₽\n"
             text += f"\n━━━━━━━━━━━━━━━━\nВсего: <b>{debtors.get('total', 0):,.2f}</b> ₽"
         else:
             text += "Список пуст"
-        
         text = text.replace(",", " ")
-        
-        is_employee = not is_owner(user_id)
-        
-        await q.edit_message_text(text, reply_markup=kb_debtors_list(debtors.get("debtors", []), is_employee), parse_mode=ParseMode.HTML)
+
+        owner_mode = is_owner(user_id)
+        await q.edit_message_text(
+            text,
+            reply_markup=kb_debtors_list(debtors.get("debtors", []), owner_mode),
+            parse_mode=ParseMode.HTML
+        )
         return ST_DEBTS_SELECT
 
     return ST_MENU
 
 
+# ========================================
+# ТРАНЗАКЦИИ
+# ========================================
 async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    
     user_id = update.effective_user.id
-    context.user_data.pop("tx", None)
     context.user_data["tx"] = {}
-    
     categories = await get_categories(user_id)
 
     if q.data == "type:expense":
@@ -655,16 +658,13 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def expense_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     categories = context.user_data.get("categories", {}).get("expenses", [])
     idx = int(q.data.split(":")[1])
     cat = categories[idx]
-
-    tx = context.user_data.get("tx", {})
-    tx["type"] = "расход"
+    tx  = context.user_data.get("tx", {})
+    tx["type"]     = "расход"
     tx["category"] = cat
     context.user_data["tx"] = tx
-
     prompt = "Сколько?\n\nПримеры: <code>2500</code>, <code>2 500</code>, <code>2.500</code>, <code>2500,50</code>, <code>2к</code>"
     await q.edit_message_text(prompt, parse_mode=ParseMode.HTML)
     return ST_AMOUNT
@@ -673,17 +673,14 @@ async def expense_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def income_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     categories = context.user_data.get("categories", {}).get("incomes", [])
     idx = int(q.data.split(":")[1])
     cat = categories[idx]
-
-    tx = context.user_data.get("tx", {})
-    tx["type"] = "доход"
-    tx["category"] = cat
+    tx  = context.user_data.get("tx", {})
+    tx["type"]         = "доход"
+    tx["category"]     = cat
     tx["payment_type"] = cat
     context.user_data["tx"] = tx
-
     prompt = "Сколько?\n\nПримеры: <code>2500</code>, <code>2 500</code>, <code>2.500</code>, <code>2500,50</code>, <code>2к</code>"
     await q.edit_message_text(prompt, parse_mode=ParseMode.HTML)
     return ST_AMOUNT
@@ -695,12 +692,11 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     amt = parse_amount(update.message.text)
-    
     try:
         await update.message.delete()
     except Exception:
         pass
-    
+
     if amt is None:
         await delete_working_message(context, update.effective_chat.id)
         msg = await update.effective_chat.send_message(
@@ -714,11 +710,10 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["tx"] = tx
 
     work_msg_id = context.user_data.get("working_message_id")
-    
+
     if tx.get("type") == "расход":
-        categories = context.user_data.get("categories", {})
+        categories    = context.user_data.get("categories", {})
         payment_types = categories.get("payment_types", [])
-        
         if work_msg_id:
             try:
                 await context.bot.edit_message_text(
@@ -729,37 +724,30 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 pass
-        
         return ST_EXP_PAYMENT_TYPE
     else:
         if work_msg_id:
             try:
-                text = "Напиши ФИО клиента или марку авто:"
-                
                 await context.bot.edit_message_text(
                     chat_id=update.effective_chat.id,
                     message_id=work_msg_id,
-                    text=text
+                    text="Напиши ФИО клиента или марку авто:"
                 )
             except Exception:
                 pass
-        
         return ST_COMMENT
 
 
 async def payment_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
-    categories = context.user_data.get("categories", {})
+    categories    = context.user_data.get("categories", {})
     payment_types = categories.get("payment_types", [])
-    idx = int(q.data.split(":")[1])
-    payment_type = payment_types[idx]
-
+    idx           = int(q.data.split(":")[1])
+    payment_type  = payment_types[idx]
     tx = context.user_data.get("tx", {})
     tx["payment_type"] = payment_type
     context.user_data["tx"] = tx
-
     await q.edit_message_text("Добавишь коммент?", reply_markup=kb_skip_comment())
     return ST_COMMENT
 
@@ -767,11 +755,9 @@ async def payment_type_selected(update: Update, context: ContextTypes.DEFAULT_TY
 async def comment_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     tx = context.user_data.get("tx", {})
     tx["comment"] = ""
     context.user_data["tx"] = tx
-
     await save_and_finish_(update, context)
     return ST_MENU
 
@@ -786,55 +772,47 @@ async def comment_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    tx = context.user_data.get("tx", {})
+    tx           = context.user_data.get("tx", {})
     comment_text = (update.message.text or "").strip()
-    
+
     if tx.get("type") == "доход" and not comment_text:
         await delete_working_message(context, update.effective_chat.id)
-        prompt = "ФИО или марка авто обязательны! Напиши:"
-        msg = await update.effective_chat.send_message(prompt)
+        msg = await update.effective_chat.send_message("ФИО или марка авто обязательны! Напиши:")
         context.user_data["working_message_id"] = msg.message_id
         return ST_COMMENT
-    
+
     tx["comment"] = comment_text
     context.user_data["tx"] = tx
-
     await save_and_finish_(update, context)
     return ST_MENU
 
 
 async def save_and_finish_(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await delete_working_message(context, update.effective_chat.id)
-    
     user_id = update.effective_user.id
-    tx = context.user_data.get("tx", {})
-    
+    tx      = context.user_data.get("tx", {})
+
     payload = {
-        "cmd": "add",
-        "type": tx.get("type"),
-        "category": tx.get("category"),
-        "amount": tx.get("amount"),
+        "cmd":          "add",
+        "type":         tx.get("type"),
+        "category":     tx.get("category"),
+        "amount":       tx.get("amount"),
         "payment_type": tx.get("payment_type"),
-        "comment": tx.get("comment", "")
+        "comment":      tx.get("comment", "")
     }
 
     try:
         await gas_request(payload, user_id)
     except Exception as e:
         await update.effective_chat.send_message(f"Ошибка: {e}")
-        if is_owner(user_id):
-            txt = await main_screen_text_owner(user_id)
-            kb = kb_main_owner()
-        else:
-            txt = await main_screen_text_employee(user_id)
-            kb = kb_main_employee()
+        txt, kb = await get_main_screen(user_id)
         await update.effective_chat.send_message(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
     if tx.get("type") == "расход":
-        header = random.choice(PH_SAVED_EXPENSE)
+        header       = random.choice(PH_SAVED_EXPENSE)
         payment_type = tx.get("payment_type", "")
-        detail = f"{tx.get('category')} — {tx.get('amount'):,.2f} ₽ — {payment_type}".replace(",", " ")
+        detail       = f"{tx.get('category')} — {tx.get('amount'):,.2f} ₽ — {payment_type}".replace(",", " ")
     else:
         header = random.choice(PH_SAVED_INCOME)
         detail = f"{tx.get('category')} — {tx.get('amount'):,.2f} ₽".replace(",", " ")
@@ -845,16 +823,13 @@ async def save_and_finish_(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_chat.send_message(f"{header}\n{detail}")
 
-    if is_owner(user_id):
-        txt = await main_screen_text_owner(user_id)
-        kb = kb_main_owner()
-    else:
-        txt = await main_screen_text_employee(user_id)
-        kb = kb_main_employee()
-    
+    txt, kb = await get_main_screen(user_id)
     await update.effective_chat.send_message(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
+# ========================================
+# АНАЛИЗ (только owner)
+# ========================================
 async def analysis_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -865,137 +840,101 @@ async def analysis_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     period = q.data.split(":")[1]
     context.user_data["analysis_period"] = period
-    
-    period_labels = {
-        "today": "Сегодня",
-        "week": "Эта неделя",
-        "month": "Этот месяц",
-        "year": "Этот год"
-    }
-    period_label = period_labels.get(period, period)
-    
+    period_labels = {"today": "Сегодня", "week": "Эта неделя", "month": "Этот месяц", "year": "Этот год"}
+    period_label  = period_labels.get(period, period)
     await q.edit_message_text(f"📊 {period_label}\n\nЧто посмотрим?", reply_markup=kb_analysis_type())
     return ST_ANALYSIS_TYPE
 
 
 async def analysis_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q       = update.callback_query
     await q.answer()
-
     user_id = update.effective_user.id
-    period = context.user_data.get("analysis_period", "month")
-    atype = q.data.split(":")[1]
 
-    period_labels = {
-        "today": "Сегодня",
-        "week": "Эта неделя",
-        "month": "Этот месяц",
-        "year": "Этот год"
-    }
-    period_label = period_labels.get(period, period)
+    if not is_owner(user_id):
+        await q.answer("Доступ запрещён", show_alert=True)
+        return ST_MENU
+
+    period       = context.user_data.get("analysis_period", "month")
+    atype        = q.data.split(":")[1]
+    period_labels = {"today": "Сегодня", "week": "Эта неделя", "month": "Этот месяц", "year": "Этот год"}
+    period_label  = period_labels.get(period, period)
 
     await delete_working_message(context, update.effective_chat.id)
 
     if atype == "income":
-        res = await gas_request({"cmd": "analysis_income", "period": period}, user_id)
-        
-        total = res.get("total", 0)
+        res    = await gas_request({"cmd": "analysis_income", "period": period}, user_id)
+        total  = res.get("total", 0)
         by_type = res.get("by_type", {})
-        
-        text = f"<b>💰 Поступления за {period_label.lower()}</b>\n\n"
-        
+        text   = f"<b>💰 Поступления за {period_label.lower()}</b>\n\n"
         if total > 0:
-            for payment_type, amount in by_type.items():
+            for ptype, amount in by_type.items():
                 percentage = (amount / total) * 100
-                emoji = "💵" if payment_type == "Наличные" else "🏢"
-                text += f"{emoji} {payment_type}: <b>{amount:,.0f}</b> ₽ ({percentage:.0f}%)\n"
+                emoji = "💵" if ptype == "Наличные" else "🏢"
+                text += f"{emoji} {ptype}: <b>{amount:,.0f}</b> ₽ ({percentage:.0f}%)\n"
             text += f"━━━━━━━━━━━━━━━━\nИтого: <b>{total:,.0f}</b> ₽"
         else:
             text += "Нет данных"
-        
         text = text.replace(",", " ")
-        
     else:
-        res = await gas_request({"cmd": "analysis_expense", "period": period}, user_id)
-        
-        total = res.get("total", 0)
+        res         = await gas_request({"cmd": "analysis_expense", "period": period}, user_id)
+        total       = res.get("total", 0)
         by_category = res.get("by_category", {})
-        
-        text = f"<b>💸 Затраты за {period_label.lower()}</b>\n\n"
-        
+        text        = f"<b>💸 Затраты за {period_label.lower()}</b>\n\n"
         if total > 0:
-            for category, amount in by_category.items():
-                text += f"{category}: <b>{amount:,.0f}</b> ₽\n"
+            for cat, amount in by_category.items():
+                text += f"{cat}: <b>{amount:,.0f}</b> ₽\n"
             text += f"━━━━━━━━━━━━━━━━\nИтого: <b>{total:,.0f}</b> ₽"
         else:
             text += "Нет данных"
-        
         text = text.replace(",", " ")
 
     await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML)
-    
-    if is_owner(user_id):
-        txt = await main_screen_text_owner(user_id)
-        kb = kb_main_owner()
-    else:
-        txt = await main_screen_text_employee(user_id)
-        kb = kb_main_employee()
-    
+    txt, kb = await get_main_screen(user_id)
     await update.effective_chat.send_message(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-    
     return ST_MENU
 
 
 async def special_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q       = update.callback_query
     await q.answer()
-
     user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+        await q.answer("Доступ запрещён", show_alert=True)
+        return ST_MENU
 
     await delete_working_message(context, update.effective_chat.id)
 
     if q.data == "special:compare":
-        res = await gas_request({"cmd": "compare_months"}, user_id)
-        
-        year = res.get("year", 2026)
+        res    = await gas_request({"cmd": "compare_months"}, user_id)
+        year   = res.get("year", 2026)
         months = res.get("months", [])
-        
-        text = f"<b>📊 Сравнение месяцев ({year})</b>\n\n"
-        
+        text   = f"<b>📊 Сравнение месяцев ({year})</b>\n\n"
         for i, month_data in enumerate(months):
             month_name = month_data.get("month", "")
-            incomes = month_data.get("incomes", 0)
-            expenses = month_data.get("expenses", 0)
-            
+            incomes    = month_data.get("incomes", 0)
+            expenses   = month_data.get("expenses", 0)
             text += f"<b>{month_name}:</b>\n"
             text += f"💰 Выручка: <b>{incomes:,.0f}</b> ₽"
-            
             if i > 0:
-                prev_incomes = months[i-1].get("incomes", 0)
-                if prev_incomes > 0:
-                    change = ((incomes - prev_incomes) / prev_incomes) * 100
-                    sign = "+" if change >= 0 else ""
-                    text += f" ({sign}{change:.0f}%)"
-            
+                prev_inc = months[i - 1].get("incomes", 0)
+                if prev_inc > 0:
+                    change = ((incomes - prev_inc) / prev_inc) * 100
+                    text += f" ({'+' if change >= 0 else ''}{change:.0f}%)"
             text += f"\n💸 Затраты: <b>{expenses:,.0f}</b> ₽"
-            
             if i > 0:
-                prev_expenses = months[i-1].get("expenses", 0)
-                if prev_expenses > 0:
-                    change = ((expenses - prev_expenses) / prev_expenses) * 100
-                    sign = "+" if change >= 0 else ""
-                    text += f" ({sign}{change:.0f}%)"
-            
+                prev_exp = months[i - 1].get("expenses", 0)
+                if prev_exp > 0:
+                    change = ((expenses - prev_exp) / prev_exp) * 100
+                    text += f" ({'+' if change >= 0 else ''}{change:.0f}%)"
             text += "\n\n"
-        
         text = text.replace(",", " ")
 
     elif q.data == "special:average":
-        res = await gas_request({"cmd": "average_check"}, user_id)
-        
+        res        = await gas_request({"cmd": "average_check"}, user_id)
         month_data = res.get("month", {})
-        year_data = res.get("year", {})
-        
+        year_data  = res.get("year", {})
         text = "<b>💰 Средний чек</b>\n\n"
         text += f"<b>За {month_data.get('month_label', 'месяц')}:</b>\n"
         text += f"Средний чек: <b>{month_data.get('average', 0):,.0f}</b> ₽\n"
@@ -1003,55 +942,47 @@ async def special_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"<b>За {year_data.get('year_label', 'год')} год:</b>\n"
         text += f"Средний чек: <b>{year_data.get('average', 0):,.0f}</b> ₽\n"
         text += f"Операций: {year_data.get('count', 0)}"
-        
         text = text.replace(",", " ")
 
     elif q.data == "special:top":
-        res = await gas_request({"cmd": "top_expenses"}, user_id)
-        
+        res        = await gas_request({"cmd": "top_expenses"}, user_id)
         month_label = res.get("month_label", "месяц")
-        total = res.get("total", 0)
+        total      = res.get("total", 0)
         categories = res.get("categories", [])
-        
         text = f"<b>📋 Топ категорий затрат ({month_label})</b>\n\n"
-        
         if categories:
             for i, cat_data in enumerate(categories, 1):
-                category = cat_data.get("category", "")
-                amount = cat_data.get("amount", 0)
-                text += f"{i}. {category}: <b>{amount:,.0f}</b> ₽\n"
+                text += f"{i}. {cat_data.get('category', '')}: <b>{cat_data.get('amount', 0):,.0f}</b> ₽\n"
             text += f"━━━━━━━━━━━━━━━━\nИтого: <b>{total:,.0f}</b> ₽"
         else:
             text += "Нет данных"
-        
         text = text.replace(",", " ")
 
-    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML)
-    
-    if is_owner(user_id):
-        txt = await main_screen_text_owner(user_id)
-        kb = kb_main_owner()
     else:
-        txt = await main_screen_text_employee(user_id)
-        kb = kb_main_employee()
-    
+        text = "Неизвестный отчёт"
+
+    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML)
+    txt, kb = await get_main_screen(user_id)
     await update.effective_chat.send_message(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-    
     return ST_MENU
 
 
+# ========================================
+# БАЛАНС (только owner)
+# ========================================
 async def balance_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q       = update.callback_query
     await q.answer()
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+        await q.answer("Доступ запрещён", show_alert=True)
+        return ST_MENU
 
     payment_type = q.data.split(":")[1]
     context.user_data["balance_payment_type"] = payment_type
-    
-    labels = {
-        "cash": "наличных",
-        "bn": "БН"
-    }
-    label = labels.get(payment_type, "")
+    labels = {"cash": "наличных", "bn": "БН"}
+    label  = labels.get(payment_type, "")
 
     await q.edit_message_text(
         f"⚙️ <b>Корректировка баланса {label}</b>\n\n"
@@ -1076,6 +1007,11 @@ async def balance_edit_received(update: Update, context: ContextTypes.DEFAULT_TY
         pass
 
     user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+        await update.effective_chat.send_message("Доступ запрещён")
+        return ST_MENU
+
     amt = parse_amount(update.message.text)
     if amt is None or amt < 0:
         await delete_working_message(context, update.effective_chat.id)
@@ -1087,116 +1023,90 @@ async def balance_edit_received(update: Update, context: ContextTypes.DEFAULT_TY
 
     payment_type = context.user_data.get("balance_payment_type", "cash")
     await gas_request({"cmd": "set_balance", "amount": amt, "payment_type": payment_type}, user_id)
-
     await delete_working_message(context, update.effective_chat.id)
 
-    labels = {
-        "cash": "наличных",
-        "bn": "БН счета"
-    }
-    label = labels.get(payment_type, "")
-
+    labels = {"cash": "наличных", "bn": "БН счета"}
+    label  = labels.get(payment_type, "")
     await update.effective_chat.send_message(
         f"Отлично! ✅ Баланс {label} установлен: <b>{amt:,.2f}</b> ₽".replace(",", " "),
         parse_mode=ParseMode.HTML
     )
-    
-    txt = await main_screen_text_owner(user_id)
-    await update.effective_chat.send_message(txt, reply_markup=kb_main_owner(), parse_mode=ParseMode.HTML)
-    
+
+    txt, kb = await get_main_screen(user_id)
+    await update.effective_chat.send_message(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
     return ST_MENU
 
 
+# ========================================
+# ДОЛГИ
+# ========================================
 async def debts_select_debtor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q       = update.callback_query
     await q.answer()
-
     user_id = update.effective_user.id
-    
-    # Если нажали "+ Внести долг"
+
     if q.data == "debts:add":
-        debt_type = context.user_data.get("debt_type", "owe_me")
+        if not is_owner(user_id):
+            await q.answer("Доступ запрещён", show_alert=True)
+            return ST_DEBTS_SELECT
+        debt_type  = context.user_data.get("debt_type", "owe_me")
         debt_label = "Долги перед Inside" if debt_type == "owe_me" else "Долги Inside"
-        
         await q.edit_message_text(
-            f"<b>{debt_label}</b>\n\n"
-            f"➕ Внести новый долг\n\n"
-            f"Введи имя должника:",
+            f"<b>{debt_label}</b>\n\n➕ Внести новый долг\n\nВведи имя должника:",
             parse_mode=ParseMode.HTML
         )
         context.user_data["working_message_id"] = q.message.message_id
         return ST_DEBTS_ADD_NAME
-    
-    # Иначе - выбрали существующего должника
+
     debtor_id = int(q.data.split(":")[1])
     context.user_data["debtor_id"] = debtor_id
-    
-    # Получаем информацию о должнике из списка
+
     debt_type = context.user_data.get("debt_type", "owe_me")
-    debtors = await gas_request({"cmd": "get_debtors_list", "debt_type": debt_type}, user_id)
-    
-    debtor = None
-    for d in debtors.get("debtors", []):
-        if d["id"] == debtor_id:
-            debtor = d
-            break
-    
+    debtors   = await gas_request({"cmd": "get_debtors_list", "debt_type": debt_type}, user_id)
+
+    debtor = next((d for d in debtors.get("debtors", []) if d["id"] == debtor_id), None)
     if not debtor:
         await q.answer("Должник не найден", show_alert=True)
         return ST_DEBTS_SELECT
-    
+
     context.user_data["debtor_name"] = debtor["name"]
-    
     text = (
         f"<b>{debtor['name']}</b>\n"
         f"Текущий долг: <b>{debtor['amount']:,.2f}</b> ₽\n\n"
     ).replace(",", " ")
-    
-    # Менеджеры могут только смотреть, не могут редактировать
-    is_employee = not is_owner(user_id)
-    
-    if is_employee:
-        text += "Это информационный режим"
-    else:
-        text += "Выбери действие:"
-    
-    await q.edit_message_text(text, reply_markup=kb_debtor_actions(is_employee), parse_mode=ParseMode.HTML)
+    text += "Выбери действие:"
+
+    owner_mode = is_owner(user_id)
+    await q.edit_message_text(text, reply_markup=kb_debtor_actions(owner_mode), parse_mode=ParseMode.HTML)
     return ST_DEBTS_SELECT
 
 
 async def debtor_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q       = update.callback_query
     await q.answer()
-
     user_id = update.effective_user.id
-    
-    # Проверяем права - только владельцы могут редактировать
-    if not is_owner(user_id):
-        await q.answer("Доступ запрещён", show_alert=True)
-        return ST_DEBTS_SELECT
-    
+
     if q.data == "debtor:edit":
         debtor_name = context.user_data.get("debtor_name", "Должник")
         await q.edit_message_text(
-            f"<b>{debtor_name}</b>\n\n"
-            f"Введи новую сумму долга:\n"
-            f"(или 0 чтобы удалить)",
+            f"<b>{debtor_name}</b>\n\nВведи новую сумму долга:\n(или 0 чтобы закрыть)",
             parse_mode=ParseMode.HTML
         )
         context.user_data["working_message_id"] = q.message.message_id
         return ST_DEBTS_AMOUNT
-    
+
     if q.data == "debtor:delete":
+        if not is_owner(user_id):
+            await q.answer("Доступ запрещён", show_alert=True)
+            return ST_DEBTS_SELECT
         debtor_id = context.user_data.get("debtor_id")
         await gas_request({"cmd": "delete_debtor", "debtor_id": debtor_id}, user_id)
-        
         await delete_working_message(context, update.effective_chat.id)
-        await update.effective_chat.send_message("✅ Должник удален")
-        
-        txt = await main_screen_text_owner(user_id)
-        await update.effective_chat.send_message(txt, reply_markup=kb_main_owner(), parse_mode=ParseMode.HTML)
+        await update.effective_chat.send_message("✅ Должник удалён")
+        txt, kb = await get_main_screen(user_id)
+        await update.effective_chat.send_message(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
         return ST_MENU
-    
+
     return ST_DEBTS_SELECT
 
 
@@ -1211,8 +1121,8 @@ async def debts_amount_received(update: Update, context: ContextTypes.DEFAULT_TY
         pass
 
     user_id = update.effective_user.id
-    amt = parse_amount(update.message.text)
-    
+    amt     = parse_amount(update.message.text)
+
     if amt is None or amt < 0:
         await delete_working_message(context, update.effective_chat.id)
         msg = await update.effective_chat.send_message(
@@ -1223,21 +1133,19 @@ async def debts_amount_received(update: Update, context: ContextTypes.DEFAULT_TY
 
     debtor_id = context.user_data.get("debtor_id")
     await gas_request({"cmd": "update_debtor", "debtor_id": debtor_id, "amount": amt}, user_id)
-
     await delete_working_message(context, update.effective_chat.id)
 
     if amt == 0:
-        await update.effective_chat.send_message("✅ Должник удален (долг погашен)")
+        await update.effective_chat.send_message("✅ Долг закрыт")
     else:
         debtor_name = context.user_data.get("debtor_name", "Должник")
         await update.effective_chat.send_message(
             f"✅ Обновлено!\n<b>{debtor_name}</b>: {amt:,.2f} ₽".replace(",", " "),
             parse_mode=ParseMode.HTML
         )
-    
-    txt = await main_screen_text_owner(user_id)
-    await update.effective_chat.send_message(txt, reply_markup=kb_main_owner(), parse_mode=ParseMode.HTML)
-    
+
+    txt, kb = await get_main_screen(user_id)
+    await update.effective_chat.send_message(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
     return ST_MENU
 
 
@@ -1252,15 +1160,13 @@ async def debts_add_name_received(update: Update, context: ContextTypes.DEFAULT_
         pass
 
     debtor_name = (update.message.text or "").strip()
-    
     if not debtor_name:
         await delete_working_message(context, update.effective_chat.id)
         msg = await update.effective_chat.send_message("Имя обязательно! Напиши:")
         context.user_data["working_message_id"] = msg.message_id
         return ST_DEBTS_ADD_NAME
-    
+
     context.user_data["new_debtor_name"] = debtor_name
-    
     work_msg_id = context.user_data.get("working_message_id")
     if work_msg_id:
         try:
@@ -1272,7 +1178,6 @@ async def debts_add_name_received(update: Update, context: ContextTypes.DEFAULT_
             )
         except Exception:
             pass
-    
     return ST_DEBTS_ADD_AMOUNT
 
 
@@ -1287,7 +1192,6 @@ async def debts_add_amount_received(update: Update, context: ContextTypes.DEFAUL
         pass
 
     amt = parse_amount(update.message.text)
-    
     if amt is None or amt <= 0:
         await delete_working_message(context, update.effective_chat.id)
         msg = await update.effective_chat.send_message(
@@ -1295,12 +1199,11 @@ async def debts_add_amount_received(update: Update, context: ContextTypes.DEFAUL
         )
         context.user_data["working_message_id"] = msg.message_id
         return ST_DEBTS_ADD_AMOUNT
-    
+
     context.user_data["new_debtor_amount"] = amt
-    
-    work_msg_id = context.user_data.get("working_message_id")
     debtor_name = context.user_data.get("new_debtor_name", "")
-    
+    work_msg_id = context.user_data.get("working_message_id")
+
     if work_msg_id:
         try:
             await context.bot.edit_message_text(
@@ -1312,26 +1215,19 @@ async def debts_add_amount_received(update: Update, context: ContextTypes.DEFAUL
             )
         except Exception:
             pass
-    
     return ST_DEBTS_ADD_PAYMENT
 
 
 async def debts_add_payment_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     payment_choice = q.data.split(":")[1]
-    
-    if payment_choice == "cash":
-        payment_type = "Наличные"
-    else:  # bn
-        payment_type = "БН (QR и счёт)"
-    
+    payment_type   = "Наличные" if payment_choice == "cash" else "БН (QR и счёт)"
     context.user_data["new_debtor_payment"] = payment_type
-    
+
     debtor_name = context.user_data.get("new_debtor_name", "")
-    amount = context.user_data.get("new_debtor_amount", 0)
-    
+    amount      = context.user_data.get("new_debtor_amount", 0)
+
     await q.edit_message_text(
         f"<b>{debtor_name}</b>\n"
         f"Сумма: {amount:,.0f} ₽\n"
@@ -1340,7 +1236,6 @@ async def debts_add_payment_selected(update: Update, context: ContextTypes.DEFAU
         parse_mode=ParseMode.HTML
     )
     context.user_data["working_message_id"] = q.message.message_id
-    
     return ST_DEBTS_ADD_COMMENT
 
 
@@ -1354,52 +1249,44 @@ async def debts_add_comment_received(update: Update, context: ContextTypes.DEFAU
     except Exception:
         pass
 
-    user_id = update.effective_user.id
-    comment = (update.message.text or "").strip()
-    
+    user_id     = update.effective_user.id
+    comment     = (update.message.text or "").strip()
     if comment == "-":
         comment = ""
-    
-    debtor_name = context.user_data.get("new_debtor_name", "")
-    amount = context.user_data.get("new_debtor_amount", 0)
-    debt_type = context.user_data.get("debt_type", "owe_me")
+
+    debtor_name  = context.user_data.get("new_debtor_name", "")
+    amount       = context.user_data.get("new_debtor_amount", 0)
+    debt_type    = context.user_data.get("debt_type", "owe_me")
     payment_type = context.user_data.get("new_debtor_payment", "Наличные")
-    
+
     await delete_working_message(context, update.effective_chat.id)
-    
-    # Добавляем должника
+
     payload = {
-        "cmd": "add_debtor",
-        "debtor_name": debtor_name,
-        "amount": amount,
-        "debt_type": debt_type,
-        "comment": comment,
+        "cmd":          "add_debtor",
+        "debtor_name":  debtor_name,
+        "amount":       amount,
+        "debt_type":    debt_type,
+        "comment":      comment,
         "payment_type": payment_type
     }
-    
+
     try:
         await gas_request(payload, user_id)
         await update.effective_chat.send_message(
-            f"✅ Долг записан!\n"
-            f"<b>{debtor_name}</b>: {amount:,.0f} ₽".replace(",", " "),
+            f"✅ Долг записан!\n<b>{debtor_name}</b>: {amount:,.0f} ₽".replace(",", " "),
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
         await update.effective_chat.send_message(f"Ошибка: {e}")
-    
-    # Показываем главный экран
-    if is_owner(user_id):
-        txt = await main_screen_text_owner(user_id)
-        kb = kb_main_owner()
-    else:
-        txt = await main_screen_text_employee(user_id)
-        kb = kb_main_employee()
-    
+
+    txt, kb = await get_main_screen(user_id)
     await update.effective_chat.send_message(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-    
     return ST_MENU
 
 
+# ========================================
+# ПРОДАЖА ПЛЕНКИ
+# ========================================
 async def film_client_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
@@ -1411,17 +1298,16 @@ async def film_client_received(update: Update, context: ContextTypes.DEFAULT_TYP
         pass
 
     client_name = (update.message.text or "").strip()
-    
     if not client_name:
         await delete_working_message(context, update.effective_chat.id)
         msg = await update.effective_chat.send_message("Имя клиента обязательно! Напиши:")
         context.user_data["working_message_id"] = msg.message_id
         return ST_FILM_CLIENT
-    
+
     film = context.user_data.get("film", {})
     film["client"] = client_name
     context.user_data["film"] = film
-    
+
     work_msg_id = context.user_data.get("working_message_id")
     if work_msg_id:
         try:
@@ -1432,7 +1318,6 @@ async def film_client_received(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except Exception:
             pass
-    
     return ST_FILM_METERS
 
 
@@ -1447,21 +1332,22 @@ async def film_meters_received(update: Update, context: ContextTypes.DEFAULT_TYP
         pass
 
     meters_text = (update.message.text or "").strip()
-    
     try:
         meters = float(meters_text.replace(",", "."))
         if meters <= 0:
             raise ValueError
     except Exception:
         await delete_working_message(context, update.effective_chat.id)
-        msg = await update.effective_chat.send_message("Не понял количество 🙈\nНапиши, пожалуйста, например: 5 или 5.5")
+        msg = await update.effective_chat.send_message(
+            "Не понял количество 🙈\nНапиши, пожалуйста, например: 5 или 5.5"
+        )
         context.user_data["working_message_id"] = msg.message_id
         return ST_FILM_METERS
-    
+
     film = context.user_data.get("film", {})
     film["meters"] = meters
     context.user_data["film"] = film
-    
+
     work_msg_id = context.user_data.get("working_message_id")
     if work_msg_id:
         try:
@@ -1473,7 +1359,6 @@ async def film_meters_received(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except Exception:
             pass
-    
     return ST_FILM_AMOUNT
 
 
@@ -1488,7 +1373,6 @@ async def film_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
         pass
 
     amt = parse_amount(update.message.text)
-    
     if amt is None or amt <= 0:
         await delete_working_message(context, update.effective_chat.id)
         msg = await update.effective_chat.send_message(
@@ -1500,13 +1384,12 @@ async def film_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
     film = context.user_data.get("film", {})
     film["amount"] = amt
     context.user_data["film"] = film
-    
+
     work_msg_id = context.user_data.get("working_message_id")
     if work_msg_id:
         try:
             client = film.get("client", "")
             meters = film.get("meters", 0)
-            
             text = (
                 f"📦 Продал пленку\n\n"
                 f"Клиент: <b>{client}</b>\n"
@@ -1514,7 +1397,6 @@ async def film_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"Сумма: <b>{amt:,.0f}</b> ₽\n\n"
                 f"Как оплатили?"
             ).replace(",", " ")
-            
             await context.bot.edit_message_text(
                 chat_id=update.effective_chat.id,
                 message_id=work_msg_id,
@@ -1524,37 +1406,33 @@ async def film_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except Exception:
             pass
-    
     return ST_FILM_PAYMENT
 
 
 async def film_payment_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
-    user_id = update.effective_user.id
+    user_id        = update.effective_user.id
     payment_choice = q.data.split(":")[1]
-    
-    film = context.user_data.get("film", {})
+
+    film   = context.user_data.get("film", {})
     client = film.get("client", "")
     meters = film.get("meters", 0)
     amount = film.get("amount", 0)
-    
+
     await delete_working_message(context, update.effective_chat.id)
-    
+
     if payment_choice == "debt":
-        # Добавляем в долг (по умолчанию Наличные)
         comment = f"Пленка {meters} м"
-        
         payload = {
-            "cmd": "add_debtor",
-            "debtor_name": client,
-            "amount": amount,
-            "debt_type": "owe_me",
-            "comment": comment,
-            "payment_type": "Наличные"
+            "cmd":          "add_debtor",
+            "debtor_name":  client,
+            "amount":       amount,
+            "debt_type":    "owe_me",
+            "comment":      comment,
+            "payment_type": "Наличные",
+            "allow_any":    True   # разрешаем admin добавлять долг через пленку
         }
-        
         try:
             await gas_request(payload, user_id)
             await update.effective_chat.send_message(
@@ -1565,27 +1443,18 @@ async def film_payment_selected(update: Update, context: ContextTypes.DEFAULT_TY
             )
         except Exception as e:
             await update.effective_chat.send_message(f"Ошибка: {e}")
-    
     else:
-        # Оплачено - создаем транзакцию
-        if payment_choice == "cash":
-            category = "Наличные"
-            payment_type = "Наличные"
-        else:  # bn
-            category = "БН (QR и счёт)"
-            payment_type = "БН (QR и счёт)"
-        
-        comment = f"{client} - Пленка {meters} м"
-        
+        category     = "Наличные"       if payment_choice == "cash" else "БН (QR и счёт)"
+        payment_type = "Наличные"       if payment_choice == "cash" else "БН (QR и счёт)"
+        comment      = f"{client} - Пленка {meters} м"
         payload = {
-            "cmd": "add",
-            "type": "доход",
-            "category": category,
-            "amount": amount,
+            "cmd":          "add",
+            "type":         "доход",
+            "category":     category,
+            "amount":       amount,
             "payment_type": payment_type,
-            "comment": comment
+            "comment":      comment
         }
-        
         try:
             await gas_request(payload, user_id)
             emoji = "💵" if payment_choice == "cash" else "🏢"
@@ -1596,31 +1465,20 @@ async def film_payment_selected(update: Update, context: ContextTypes.DEFAULT_TY
             )
         except Exception as e:
             await update.effective_chat.send_message(f"Ошибка: {e}")
-    
-    # Показываем главный экран
-    if is_owner(user_id):
-        txt = await main_screen_text_owner(user_id)
-        kb = kb_main_owner()
-    else:
-        txt = await main_screen_text_employee(user_id)
-        kb = kb_main_employee()
-    
+
+    txt, kb = await get_main_screen(user_id)
     await update.effective_chat.send_message(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-    
     return ST_MENU
 
 
+# ========================================
+# HELP / ERROR
+# ========================================
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
         return
-    await update.message.reply_text(
-        "Кнопки внизу 🙂\n"
-        "• Внести транзакцию\n"
-        "• Анализ (только для владельцев)\n"
-        "• Сверить баланс (только для владельцев)\n"
-        "• Долги (только для владельцев)"
-    )
+    await update.message.reply_text("Кнопки внизу 🙂\nЕсли что-то не работает — напиши /start")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1632,6 +1490,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+# ========================================
+# BUILD APP
+# ========================================
 def build_app() -> Application:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -1639,20 +1500,20 @@ def build_app() -> Application:
         entry_points=[CommandHandler("start", cmd_start)],
         states={
             ST_MENU: [
-                CallbackQueryHandler(on_menu, pattern=r"^menu:"),
+                CallbackQueryHandler(on_menu,          pattern=r"^menu:"),
                 CallbackQueryHandler(balance_edit_start, pattern=r"^balance:(cash|bn)$"),
             ],
             ST_ADD_CHOOSE_TYPE: [
-                CallbackQueryHandler(choose_type, pattern=r"^type:"),
-                CallbackQueryHandler(back_router, pattern=r"^back:"),
+                CallbackQueryHandler(choose_type,  pattern=r"^type:"),
+                CallbackQueryHandler(back_router,  pattern=r"^back:"),
             ],
             ST_EXP_CATEGORY: [
                 CallbackQueryHandler(expense_category, pattern=r"^expcat:\d+$"),
-                CallbackQueryHandler(back_router, pattern=r"^back:"),
+                CallbackQueryHandler(back_router,      pattern=r"^back:"),
             ],
             ST_INC_CATEGORY: [
                 CallbackQueryHandler(income_category, pattern=r"^inccat:\d+$"),
-                CallbackQueryHandler(back_router, pattern=r"^back:"),
+                CallbackQueryHandler(back_router,     pattern=r"^back:"),
             ],
             ST_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, amount_received),
@@ -1661,20 +1522,20 @@ def build_app() -> Application:
                 CallbackQueryHandler(payment_type_selected, pattern=r"^payment:\d+$"),
             ],
             ST_COMMENT: [
-                CallbackQueryHandler(comment_skip, pattern=r"^comment:skip$"),
+                CallbackQueryHandler(comment_skip,   pattern=r"^comment:skip$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, comment_received),
             ],
             ST_ANALYSIS_PERIOD: [
                 CallbackQueryHandler(analysis_period, pattern=r"^aperiod:"),
-                CallbackQueryHandler(back_router, pattern=r"^back:"),
+                CallbackQueryHandler(back_router,     pattern=r"^back:"),
             ],
             ST_ANALYSIS_TYPE: [
                 CallbackQueryHandler(analysis_type, pattern=r"^atype:"),
-                CallbackQueryHandler(back_router, pattern=r"^back:"),
+                CallbackQueryHandler(back_router,   pattern=r"^back:"),
             ],
             ST_SPECIAL_REPORTS: [
                 CallbackQueryHandler(special_reports, pattern=r"^special:"),
-                CallbackQueryHandler(back_router, pattern=r"^back:"),
+                CallbackQueryHandler(back_router,     pattern=r"^back:"),
             ],
             ST_BALANCE_EDIT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, balance_edit_received),
@@ -1682,8 +1543,8 @@ def build_app() -> Application:
             ST_DEBTS_SELECT: [
                 CallbackQueryHandler(debts_select_debtor, pattern=r"^debtor:\d+$"),
                 CallbackQueryHandler(debts_select_debtor, pattern=r"^debts:add$"),
-                CallbackQueryHandler(debtor_action, pattern=r"^debtor:(edit|delete)$"),
-                CallbackQueryHandler(back_router, pattern=r"^back:"),
+                CallbackQueryHandler(debtor_action,       pattern=r"^debtor:(edit|delete)$"),
+                CallbackQueryHandler(back_router,         pattern=r"^back:"),
             ],
             ST_DEBTS_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, debts_amount_received),
@@ -1711,7 +1572,7 @@ def build_app() -> Application:
             ],
             ST_FILM_PAYMENT: [
                 CallbackQueryHandler(film_payment_selected, pattern=r"^film_payment:"),
-                CallbackQueryHandler(back_router, pattern=r"^back:"),
+                CallbackQueryHandler(back_router,           pattern=r"^back:"),
             ],
         },
         fallbacks=[CommandHandler("help", cmd_help)],
@@ -1726,13 +1587,10 @@ def build_app() -> Application:
 
 def run():
     app = build_app()
-
     if WEBHOOK_URL:
-        url_path = WEBHOOK_PATH or _default_webhook_path()
+        url_path     = WEBHOOK_PATH or _default_webhook_path()
         full_webhook = f"{WEBHOOK_URL.rstrip('/')}/{url_path}"
-
         logger.info("Starting webhook on 0.0.0.0:%s", PORT)
-
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
