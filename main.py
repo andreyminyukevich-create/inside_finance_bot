@@ -2,6 +2,7 @@ import os
 import re
 import json
 import random
+import asyncio
 import logging
 import hashlib
 from typing import Optional, Dict, Any, List
@@ -319,26 +320,106 @@ def parse_amount(text: str) -> Optional[float]:
 
 
 # ========================================
-# GAS ЗАПРОСЫ
+# GAS ЗАПРОСЫ (persistent session + 3 retries + 30s timeout)
 # ========================================
+_gas_session: Optional[aiohttp.ClientSession] = None
+
+
+async def _get_gas_session() -> aiohttp.ClientSession:
+    """Возвращает persistent ClientSession, создавая её при первом вызове."""
+    global _gas_session
+    if _gas_session is None or _gas_session.closed:
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+        _gas_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        logger.info("Created new GAS session")
+    return _gas_session
+
+
+async def _close_gas_session():
+    """Закрывает GAS session при остановке бота."""
+    global _gas_session
+    if _gas_session is not None and not _gas_session.closed:
+        await _gas_session.close()
+        logger.info("Closed GAS session")
+
+
 async def gas_request(payload: Dict[str, Any], user_id: int) -> Dict[str, Any]:
+    """
+    Отправляет запрос в GAS с автоматическими ретраями.
+    - 3 попытки с задержкой 1.5с / 3с
+    - Ретрай на: timeout, 5xx, network errors
+    - Без ретрая на: 4xx, GAS вернул ok=false (бизнес-ошибка)
+    """
     payload = dict(payload)
     payload["user_id"]    = user_id
-    payload["actor_id"]   = user_id          # кто совершил действие
-    payload["account_id"] = STUDIO_ACCOUNT_ID  # единый контур студии
+    payload["actor_id"]   = user_id
+    payload["account_id"] = STUDIO_ACCOUNT_ID
 
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(SCRIPT_URL, json=payload) as resp:
-            txt = await resp.text()
-            try:
-                data = json.loads(txt)
-            except Exception:
-                logger.error("GAS non-json response: %s", txt)
-                raise RuntimeError("GAS вернул не-JSON ответ")
-            if not data.get("ok"):
-                raise RuntimeError(data.get("error") or "GAS error")
-            return data["data"]
+    session = await _get_gas_session()
+    max_attempts = 3
+    last_error: Optional[str] = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with session.post(SCRIPT_URL, json=payload) as resp:
+                # 5xx — повторяем
+                if resp.status >= 500:
+                    last_error = f"HTTP {resp.status}"
+                    logger.warning(
+                        "GAS attempt %d/%d failed: %s (cmd=%s)",
+                        attempt, max_attempts, last_error, payload.get("cmd")
+                    )
+                    if attempt < max_attempts:
+                        await asyncio.sleep(1.5 * attempt)
+                        continue
+                    raise RuntimeError(f"GAS вернул {last_error} после {max_attempts} попыток")
+
+                # 4xx — не повторяем, что-то не так с запросом
+                if resp.status >= 400:
+                    txt = await resp.text()
+                    logger.error("GAS HTTP %d (cmd=%s): %s", resp.status, payload.get("cmd"), txt[:500])
+                    raise RuntimeError(f"GAS HTTP {resp.status}")
+
+                txt = await resp.text()
+                try:
+                    data = json.loads(txt)
+                except Exception:
+                    logger.error("GAS non-json response (cmd=%s): %s", payload.get("cmd"), txt[:500])
+                    raise RuntimeError("GAS вернул не-JSON ответ")
+
+                if not data.get("ok"):
+                    # Бизнес-ошибка GAS — не ретраим
+                    raise RuntimeError(data.get("error") or "GAS error")
+
+                if attempt > 1:
+                    logger.info("GAS recovered on attempt %d (cmd=%s)", attempt, payload.get("cmd"))
+                return data["data"]
+
+        except asyncio.TimeoutError:
+            last_error = "timeout"
+            logger.warning(
+                "GAS timeout, attempt %d/%d (cmd=%s)",
+                attempt, max_attempts, payload.get("cmd")
+            )
+            if attempt < max_attempts:
+                await asyncio.sleep(1.5 * attempt)
+                continue
+            raise RuntimeError("GAS не ответил за 30 сек (3 попытки)")
+
+        except aiohttp.ClientError as e:
+            last_error = str(e)
+            logger.warning(
+                "GAS network error: %s, attempt %d/%d (cmd=%s)",
+                e, attempt, max_attempts, payload.get("cmd")
+            )
+            if attempt < max_attempts:
+                await asyncio.sleep(1.5 * attempt)
+                continue
+            raise RuntimeError(f"Сетевая ошибка GAS: {e}")
+
+    # Сюда не должны добираться, но на всякий
+    raise RuntimeError(last_error or "Unknown GAS error")
 
 
 # ========================================
@@ -1494,7 +1575,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # BUILD APP
 # ========================================
 def build_app() -> Application:
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_shutdown(_on_shutdown).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
@@ -1583,6 +1664,11 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_error_handler(error_handler)
     return app
+
+
+async def _on_shutdown(app: Application) -> None:
+    """Graceful shutdown: закрываем persistent GAS session."""
+    await _close_gas_session()
 
 
 def run():
